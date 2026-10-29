@@ -10,6 +10,7 @@ import {
   estimateCostUsd,
   fence,
   renderExchange,
+  stripMarkers,
   truncate,
   type Transport,
 } from '../src/ai/client.js';
@@ -486,5 +487,68 @@ describe('cost reporting', () => {
   test('token approximation is in the right order of magnitude', () => {
     const tokens = approximateTokens('a'.repeat(3600));
     assert.ok(tokens > 500 && tokens < 2000, `got ${tokens}`);
+  });
+});
+
+describe('the fence markers cannot be injected from outside the fence', () => {
+  // `fence()` neutralises markers inside the evidence block. The prompt also
+  // places a check's `detail` before that block, and several checks quote
+  // captured bytes inside it -- the reflection check interpolates a
+  // 160-character window of the response body. JSON.stringify escapes quotes,
+  // backslashes and control characters and does nothing to `<` or `>`, so a
+  // response body containing the close marker put that marker into the prompt
+  // in a position implying the instructions above it were themselves data.
+  const base: Finding = {
+    id: 'f',
+    check: 'AWB-A001',
+    title: 't',
+    severity: 'high',
+    confidence: 'firm',
+    evidence: [],
+    detail: 'd',
+    remediation: 'r',
+    url: 'https://target.example.test/',
+    at: 0,
+  };
+
+  const markerCount = (finding: Finding): [number, number] => {
+    const prompt = JSON.stringify(buildTriageRequest(finding, []));
+    const escape = (s: string): string => s.replace(/[<>]/g, '.');
+    return [
+      (prompt.match(new RegExp(escape(EVIDENCE_OPEN), 'g')) ?? []).length,
+      (prompt.match(new RegExp(escape(EVIDENCE_CLOSE), 'g')) ?? []).length,
+    ];
+  };
+
+  test('a marker in any finding field adds none to the prompt', () => {
+    const clean = markerCount(base);
+    for (const field of ['title', 'detail', 'remediation'] as const) {
+      for (const marker of [EVIDENCE_OPEN, EVIDENCE_CLOSE]) {
+        const hostile = { ...base, [field]: `before ${marker} after` };
+        assert.deepEqual(markerCount(hostile), clean, `${field} with ${marker}`);
+      }
+    }
+  });
+
+  test('the injected marker is replaced rather than dropped silently', () => {
+    const prompt = JSON.stringify(
+      buildTriageRequest({ ...base, detail: `x ${EVIDENCE_CLOSE} y` }, []),
+    );
+    assert.ok(prompt.includes('[marker removed]'));
+  });
+
+  test('stripMarkers leaves ordinary text alone', () => {
+    assert.equal(stripMarkers('an ordinary detail <p> with angle brackets'), 'an ordinary detail <p> with angle brackets');
+  });
+
+  test('markers are stripped even when secrets are being sent deliberately', () => {
+    // --unsafe-send-secrets is still a run whose prompt structure the target
+    // must not control.
+    const prompt = JSON.stringify(
+      buildTriageRequest({ ...base, detail: `x ${EVIDENCE_CLOSE} y` }, [], {
+        render: { unsafeSendSecrets: true },
+      }),
+    );
+    assert.ok(prompt.includes('[marker removed]'));
   });
 });

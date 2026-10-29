@@ -25,6 +25,7 @@ import {
   BASE_SYSTEM,
   MODELS,
   fence,
+  stripMarkers,
   renderExchange,
 } from './client.js';
 
@@ -43,13 +44,23 @@ function field(type: string, description: string, extra: Record<string, unknown>
  * that the prompt must not contain a credential present in the capture.
  */
 function scrubFinding(finding: Finding, render: RenderOptions): Finding {
-  if (render.unsafeSendSecrets === true) return finding;
-  return {
+  // The markers are stripped whether or not secrets are being sent: an
+  // --unsafe-send-secrets run is still a run whose prompt structure the
+  // target must not control.
+  const clean = {
     ...finding,
-    title: redactText(finding.title),
-    detail: redactText(finding.detail),
-    remediation: redactText(finding.remediation),
-    url: redactUrl(finding.url),
+    title: stripMarkers(finding.title),
+    detail: stripMarkers(finding.detail),
+    remediation: stripMarkers(finding.remediation),
+    url: stripMarkers(finding.url),
+  };
+  if (render.unsafeSendSecrets === true) return clean;
+  return {
+    ...clean,
+    title: redactText(clean.title),
+    detail: redactText(clean.detail),
+    remediation: redactText(clean.remediation),
+    url: redactUrl(clean.url),
   };
 }
 

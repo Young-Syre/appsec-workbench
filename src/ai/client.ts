@@ -334,15 +334,32 @@ export function truncate(text: string, limit: number): string {
 export const EVIDENCE_OPEN = '<<<AWB-EVIDENCE-BEGIN-7f3a1c>>>';
 export const EVIDENCE_CLOSE = '<<<AWB-EVIDENCE-END-7f3a1c>>>';
 
-export function fence(evidence: string): string {
-  // If the evidence somehow contains a marker, neutralise it rather than
-  // emitting a prompt whose structure the evidence controls.
-  const safe = evidence
+/**
+ * Remove the fence markers from a run of text.
+ *
+ * Needed in two places, which is why it is separate from `fence`. Inside the
+ * fence it stops captured bytes closing their own container. *Outside* the
+ * fence it matters just as much and was missing: a check's `detail` is prose
+ * the tool wrote, but several checks quote captured bytes inside it -- the
+ * reflection check interpolates a 160-character window of the response body --
+ * and `detail` is placed in the prompt before the fence opens. `JSON.stringify`
+ * escapes quotes, backslashes and control characters, and does nothing to `<`
+ * or `>`, so a response body containing the close marker put that marker into
+ * the prompt in a position implying the instructions above it were themselves
+ * fenced data.
+ */
+export function stripMarkers(text: string): string {
+  return text
     .split(EVIDENCE_OPEN)
     .join('[marker removed]')
     .split(EVIDENCE_CLOSE)
     .join('[marker removed]');
-  return `${EVIDENCE_OPEN}\n${safe}\n${EVIDENCE_CLOSE}`;
+}
+
+export function fence(evidence: string): string {
+  // If the evidence somehow contains a marker, neutralise it rather than
+  // emitting a prompt whose structure the evidence controls.
+  return `${EVIDENCE_OPEN}\n${stripMarkers(evidence)}\n${EVIDENCE_CLOSE}`;
 }
 
 /**
