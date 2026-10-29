@@ -90,6 +90,10 @@ describe('bodies are scrubbed by shape, not only where a header named them', () 
   });
 
   test('a private key block, all of it', () => {
+    // Not a key: the PEM header and footer with sixteen characters of the
+    // published 512-bit documentation key between them. It is here because the
+    // redactor has to remove the whole block rather than only the header, and
+    // there is no key material to remove.
     const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj3\n-----END RSA PRIVATE KEY-----';
     const out = redactText(`key: ${pem}`);
     assert.ok(!out.includes('MIIBOgIBAAJBAKj3'));
