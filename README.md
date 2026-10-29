@@ -361,8 +361,12 @@ per request, bounded by a budget, and every request recorded.
 | `AWB-A009` | Authorisation differs by HTTP method | 4 | |
 | `AWB-A010` | Object reachable by another session | 2 | |
 | `AWB-A011` | Time-based injection | 8 | |
+| `AWB-A012` | CRLF injection into a response header | 3 | |
+| `AWB-A013` | OS command injection | 4 | yes |
+| `AWB-A014` | XML external entity | 2 | yes |
+| `AWB-A015` | GraphQL introspection is enabled | 1 | |
 
-Three of these are worth describing, because they are where a scanner usually
+Four of these are worth describing, because they are where a scanner usually
 goes wrong.
 
 **`AWB-A001`** sends a marker first and only then sends anything shaped like an
@@ -386,6 +390,18 @@ the baseline median by four times the baseline's own interquartile spread
 requests, three test requests. A service whose ordinary response time varies by
 seconds cannot support a five-second timing claim, and this says so rather than
 reporting the network.
+
+**`AWB-A013` and `AWB-A014`** prefer a callback to a guess. Command injection
+sends a payload that fetches a unique URL, and reports only if the workbench's
+own listener records the fetch — a confirmation that works on a blind
+injection, where there is no command output to read. Without a listener, it
+falls back to a `sleep` judged the same conservative way as `AWB-A011`, and
+says in the finding that it is an inference rather than a recorded callback.
+XXE is the same idea for an XML body: an external entity pointing at the
+listener, reported only if the parser resolves it. **`AWB-A015`** asks whether
+GraphQL introspection answers, and confirms from structure the query did not
+itself contain, so that an endpoint which merely echoes the request back does
+not satisfy it.
 
 ### Out-of-band interactions
 
@@ -539,7 +555,7 @@ pretending otherwise. Specifically:
   so browsers open them over HTTP/1.1, where they are recorded as before.
 - **No extension ecosystem.** It is a library as well as a CLI, so a check of
   your own is thirty lines of TypeScript, but there is no BApp Store.
-- **The active checks are not a scanner.** Eleven checks, each answering one
+- **The active checks are not a scanner.** Fifteen checks, each answering one
   question with evidence. Burp's scanner has hundreds of them and years of
   false-positive tuning.
 - **No session-handling macros that log in for you.** `awb browse --login-script`
