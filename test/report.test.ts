@@ -295,3 +295,65 @@ describe('format and severity parsing', () => {
     assert.throws(() => parseSeverity('urgent'), /Known: critical, high, medium, low, info/);
   });
 });
+
+describe('no reporter renders a credential that arrived only in a URL', () => {
+  // This is the CI assertion widened. It used to put the credential in a
+  // Cookie, which observedSecrets harvested, so every reporter passed while a
+  // token delivered as `?access_token=...` -- the case AWB-P040 exists to
+  // report -- reached the output through the finding's own detail,
+  // remediation and url.
+  const TOKEN = 'a9f3c1e7b25d4086b1c4e7f20a5d8311';
+  const url = `https://target.example.test/api/me?access_token=${TOKEN}`;
+
+  const request = {
+    method: 'GET',
+    url,
+    httpVersion: '1.1',
+    headers: [
+      ['Host', 'target.example.test'],
+      ['Referer', `https://target.example.test/cb?code=${TOKEN}`],
+    ] as [string, string][],
+    body: Buffer.alloc(0),
+    startedAt: 0,
+  };
+  const exchange = {
+    id: 'aaaabbbbccccdddd',
+    request,
+    response: {
+      status: 200,
+      statusText: 'OK',
+      httpVersion: '1.1',
+      headers: [['Content-Type', 'application/json']] as [string, string][],
+      // Echoed back under a name no credential-field list contains, which is
+      // exactly why the literal set has to be populated.
+      body: Buffer.from(JSON.stringify({ echo: TOKEN, nested: { mirrored: TOKEN } })),
+      elapsedMs: 1,
+    },
+    source: 'proxy' as const,
+    tags: [] as string[],
+  };
+  const finding = {
+    id: 'f',
+    check: 'AWB-P040',
+    title: 'credential in URL',
+    severity: 'high' as const,
+    confidence: 'firm' as const,
+    evidence: ['aaaabbbbccccdddd'],
+    detail: `the URL carried access_token=${TOKEN}`,
+    // A bare value with no credential-shaped name in front of it.
+    remediation: `Stop putting ${TOKEN} in a URL.`,
+    url,
+    at: 0,
+  };
+  const options = { exchanges: new Map([[exchange.id, exchange]]) };
+
+  for (const format of ['text', 'json', 'markdown', 'sarif'] as const) {
+    test(`${format} is clean`, () => {
+      assert.ok(!render(format, [finding], options).includes(TOKEN));
+    });
+  }
+
+  test('--unsafe-show-secrets still shows it, so the assertion proves something', () => {
+    assert.ok(render('text', [finding], { ...options, showSecrets: true }).includes(TOKEN));
+  });
+});

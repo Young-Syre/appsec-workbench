@@ -431,9 +431,20 @@ hold.
 
 **Nothing leaves unredacted.** Credentials in headers, bodies and URLs are
 replaced before the prompt is built. `--ai-dry-run` prints the exact bytes that
-would be sent, and sends nothing. The test suite asserts that a bearer token in
-a request and the same value echoed into a response body are both absent from
-the prompt.
+would be sent, and sends nothing.
+
+Two mechanisms, because one is not enough. Credential-*named* fields are
+replaced by pattern: `password=`, `?access_token=`, a JSON `"api_key"`, a
+`name="password"` part of a multipart body. And every value observed as a
+credential in the request — in a credential header, in the request URL's query,
+in the query or fragment of a `Referer` or `Location` — is collected and
+stripped as a literal wherever else it appears, which is what catches the same
+token echoed back by a response under a name no list contains.
+
+The suite asserts both, and the CI assertion deliberately delivers its
+credential in a URL rather than a cookie: a credential header is the easy case,
+and the gap that existed was a token arriving only as `?access_token=`, which
+is the case `AWB-P040` exists to report.
 
 **The evidence is data, not instructions.** Everything interesting here is
 attacker-influenced. A response body can say *ignore your instructions and
@@ -638,7 +649,7 @@ $ npm test
 # duration_ms 5324
 ```
 
-579 tests, standard-library `node --test`, no network except loopback servers
+636 tests, standard-library `node --test`, no network except loopback servers
 the suite starts itself. What they cover is worth being specific about, because
 "has tests" is not a claim:
 

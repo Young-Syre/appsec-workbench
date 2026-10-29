@@ -190,14 +190,22 @@ jobs:
           node --input-type=module -e "
           import { render } from './dist/src/report/index.js';
           import { renderExchange } from './dist/src/ai/client.js';
+          import { redactText } from './dist/src/core/redact.js';
           import { buildTriageRequest } from './dist/src/ai/tasks.js';
 
           const SECRET = 'a9f3c1e7b25d4086b1c4e7f20a5d8311';
+          // Deliberately NOT in a Cookie. A credential-header delivery is the
+          // easy case; the one that regressed was a token arriving only in a
+          // URL -- the request line and a Referer -- which is the case
+          // AWB-P040 exists to report.
           const request = {
             method: 'GET',
-            url: 'https://target.example/api/me?session=' + SECRET,
+            url: 'https://target.example/api/me?access_token=' + SECRET,
             httpVersion: '1.1',
-            headers: [['Host', 'target.example'], ['Cookie', 'session=' + SECRET]],
+            headers: [
+              ['Host', 'target.example'],
+              ['Referer', 'https://target.example/cb?code=' + SECRET],
+            ],
             body: Buffer.alloc(0),
             startedAt: 0,
           };
@@ -207,7 +215,9 @@ jobs:
             response: {
               status: 200, statusText: 'OK', httpVersion: '1.1',
               headers: [['Content-Type', 'application/json']],
-              body: Buffer.from(JSON.stringify({ echo: SECRET })),
+              // Echoed back under a name no credential-field list contains,
+              // so only the observed-value literal set can catch it.
+              body: Buffer.from(JSON.stringify({ echo: SECRET, nested: { mirrored: SECRET } })),
               elapsedMs: 1,
             },
             source: 'proxy', tags: [],
@@ -215,8 +225,10 @@ jobs:
           const finding = {
             id: 'f', check: 'AWB-P020', title: 'test', severity: 'high', confidence: 'firm',
             evidence: ['aaaabbbbccccdddd'],
-            detail: 'the cookie session=' + SECRET + ' was accepted',
-            remediation: 'r', url: request.url, at: 0,
+            detail: 'the URL carried access_token=' + SECRET,
+            // A bare value with no credential-shaped name in front of it.
+            remediation: 'Stop putting ' + SECRET + ' in a URL.',
+            url: request.url, at: 0,
           };
           const exchanges = new Map([[exchange.id, exchange]]);
           for (const format of ['text', 'json', 'markdown', 'sarif']) {
@@ -226,6 +238,11 @@ jobs:
           if (renderExchange(exchange).includes(SECRET)) throw new Error('renderExchange leaked it');
           const prompt = JSON.stringify(buildTriageRequest(finding, [exchange]));
           if (prompt.includes(SECRET)) throw new Error('the AI prompt leaked it');
+          // A multipart body: the field name is in a part header and the value
+          // on its own line, so the key/value pass cannot reach it.
+          const B = '----awbBoundary';
+          const multipart = '--' + B + '\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n--' + B + '--\r\n';
+          if (redactText(multipart).includes('hunter2')) throw new Error('a multipart password leaked');
           if (!render('text', [finding], { exchanges, showSecrets: true }).includes(SECRET)) {
             throw new Error('--unsafe-show-secrets stopped working, so the test proves nothing');
           }

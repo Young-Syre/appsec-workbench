@@ -46,12 +46,38 @@ function filtered(findings: readonly Finding[], options: ReportOptions): Finding
 
 function scrubFinding(finding: Finding, options: ReportOptions): Finding {
   if (options.showSecrets === true) return finding;
+  // The literal values observed in the finding's own evidence, as well as the
+  // credential-name patterns. A check's `detail` and `remediation` quote
+  // captured bytes, and a credential does not always arrive with a
+  // credential-shaped name in front of it -- which is the whole reason the
+  // literal set exists. Scrubbing these two fields by pattern alone left a
+  // value that had been seen in the request readable in the report.
+  const extraValues = evidenceSecrets(finding, options);
+  const scrub = (text: string): string => redactText(text, { extraValues });
   return {
     ...finding,
-    url: redactUrl(finding.url),
-    detail: redactText(finding.detail),
-    title: redactText(finding.title),
+    url: redactUrl(finding.url, { extraValues }),
+    detail: scrub(finding.detail),
+    title: scrub(finding.title),
+    // `remediation` is built from captured bytes by some checks -- cookies.ts
+    // interpolates the cookie's own name -- and the AI prompt builder has
+    // always redacted it. Two implementations of the same scrub, agreeing on
+    // three fields and differing on the fourth, with no test across the seam.
+    remediation: scrub(finding.remediation),
   };
+}
+
+/** Every credential value observed in the exchanges a finding cites. */
+function evidenceSecrets(finding: Finding, options: ReportOptions): string[] {
+  const exchanges = options.exchanges;
+  if (exchanges === undefined) return [];
+  const out: string[] = [];
+  for (const id of finding.evidence) {
+    const exchange = exchanges.get(id);
+    if (exchange === undefined) continue;
+    out.push(...observedSecrets(exchange.request.headers, exchange.request.url));
+  }
+  return out;
 }
 
 export function counts(findings: readonly Finding[]): Record<Severity, number> {
@@ -274,7 +300,7 @@ function quoteEvidence(finding: Finding, options: ReportOptions): string | undef
   if (exchange === undefined) return undefined;
 
   const show = options.showSecrets === true;
-  const secrets = show ? [] : observedSecrets(exchange.request.headers);
+  const secrets = show ? [] : observedSecrets(exchange.request.headers, exchange.request.url);
   const request = serialiseRequest({
     ...exchange.request,
     headers: show ? exchange.request.headers : redactHeaders(exchange.request.headers),

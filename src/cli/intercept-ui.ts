@@ -262,14 +262,22 @@ export class InterceptConsole {
     const rule = `-- ${held.kind} #${held.id} -- ${waiting} held `.padEnd(72, '-');
     const text =
       held.kind === 'request'
-        ? this.messageText(serialiseRequestHead(held.request, this.options.showSecrets), held.request.headers, held.request.body, held.request.headers)
+        ? this.messageText(
+            serialiseRequestHead(held.request, this.options.showSecrets),
+            held.request.headers,
+            held.request.body,
+            held.request,
+          )
         : this.messageText(
             serialiseResponseHead(held.response, this.options.showSecrets),
             held.response.headers,
             held.response.body,
-            held.request.headers,
+            held.request,
           );
-    const target = held.kind === 'response' ? `  for ${held.request.method} ${this.scrub(held.request.url, held.request.headers)}\n` : '';
+    const target =
+      held.kind === 'response'
+        ? `  for ${held.request.method} ${this.scrub(held.request.url, held.request)}\n`
+        : '';
     return `\n${rule}\n${target}${text}\n${KEYS}\n`;
   }
 
@@ -277,7 +285,7 @@ export class InterceptConsole {
     head: string,
     headers: HttpRequest['headers'],
     body: Buffer,
-    credentialSource: HttpRequest['headers'],
+    credentialSource: HttpRequest,
   ): string {
     let shown = '';
     if (body.length > 0) {
@@ -294,9 +302,13 @@ export class InterceptConsole {
     return this.scrub(`${head}\r\n\r\n${shown}`, credentialSource);
   }
 
-  private scrub(text: string, credentialSource: HttpRequest['headers']): string {
+  private scrub(text: string, credentialSource: HttpRequest): string {
     if (this.options.showSecrets === true) return text;
-    return redactText(text, { extraValues: observedSecrets(credentialSource) });
+    // The request's URL as well as its headers: a token that arrived as
+    // `?access_token=...` is a literal the response body may echo back.
+    return redactText(text, {
+      extraValues: observedSecrets(credentialSource.headers, credentialSource.url),
+    });
   }
 }
 

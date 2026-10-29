@@ -189,3 +189,120 @@ describe('observedSecrets collects the literal values to scrub elsewhere', () =>
     assert.ok(!out.includes(SESSION));
   });
 });
+
+describe('a credential inside a URL', () => {
+  // The key/value pass matched with key `https` and a value running to the
+  // next `&`, declined it because `https` is not a credential field, and had
+  // already consumed the `access_token` that followed -- so it never got a
+  // match of its own. Every credential carried in a URL survived redaction,
+  // in header values, in bodies, and anywhere else redactText is what runs.
+  const TOKEN = 'abcdef0123456789abcdef0123456789';
+
+  test('is redacted wherever in the URL it sits', () => {
+    for (const url of [
+      `https://app.example.test/cb?access_token=${TOKEN}`,
+      `https://app.example.test/cb?code=${TOKEN}&state=xyz`,
+      `https://app.example.test/l?password=${TOKEN}`,
+      `http://app.example.test/l?page=2&api_key=${TOKEN}&sort=asc`,
+      `Referer: https://app.example.test/cb?access_token=${TOKEN}`,
+    ]) {
+      assert.ok(!redactText(url).includes(TOKEN), url);
+    }
+  });
+
+  test('is redacted more than once in the same URL', () => {
+    const out = redactText(`https://a.example.test/cb?code=${TOKEN}&access_token=${TOKEN}`);
+    assert.ok(!out.includes(TOKEN));
+    assert.equal(out.match(/\[redacted:/g)?.length, 2);
+  });
+
+  test('leaves the rest of the URL alone', () => {
+    const out = redactText(`https://a.example.test/x?page=2&utm_source=mail&token=${TOKEN}`);
+    assert.ok(out.startsWith('https://a.example.test/x?page=2&utm_source=mail&token='));
+    assert.ok(!out.includes(TOKEN));
+  });
+
+  test('does not redact a field whose name merely ends in a credential word', () => {
+    // `code` is matched whole, not as a suffix: a status code is something a
+    // report has to be able to show.
+    for (const text of [
+      '{"status_code":404}',
+      '{"error_code":"E_LIMIT"}',
+      '{"country_code":"GB"}',
+      'https://a.example.test/x?page=2&utm_source=mail',
+    ]) {
+      assert.equal(redactText(text), text);
+    }
+  });
+
+  test('covers the credential names that had no entry', () => {
+    for (const field of ['passphrase', 'nonce', 'code', 'code_verifier']) {
+      const text = `{"${field}":"${TOKEN}"}`;
+      assert.ok(!redactText(text).includes(TOKEN), field);
+    }
+  });
+});
+
+describe('a credential inside a multipart body', () => {
+  // multipart/form-data puts the field name in a Content-Disposition header
+  // and the value on its own line, so the key/value pass cannot reach it:
+  // there is no credential name in front of the value. A password typed into
+  // an ordinary HTML login form arrives this way.
+  const BOUNDARY = '----WebKitFormBoundaryAbC123';
+  const part = (name: string, value: string): string =>
+    `--${BOUNDARY}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`;
+  const body = part('username', 'alice') + part('password', 'hunter2') + part('csrf_token', 'tok-9f8e7d6c5b4a') + `--${BOUNDARY}--\r\n`;
+
+  test('redacts the credential-named parts', () => {
+    const out = redactText(body);
+    assert.ok(!out.includes('hunter2'));
+    assert.ok(!out.includes('tok-9f8e7d6c5b4a'));
+  });
+
+  test('leaves every other part, boundary and part header byte for byte', () => {
+    const out = redactText(body);
+    assert.ok(out.includes('alice'), 'a part that is not a credential survives');
+    assert.equal(out.split(`--${BOUNDARY}`).length, body.split(`--${BOUNDARY}`).length);
+    assert.ok(out.includes('Content-Disposition: form-data; name="password"'));
+    assert.ok(out.trimEnd().endsWith(`--${BOUNDARY}--`));
+  });
+
+  test('leaves a body that is not multipart alone', () => {
+    assert.equal(redactText('just some text\r\nwith lines\r\n'), 'just some text\r\nwith lines\r\n');
+  });
+});
+
+describe('a credential that arrived only in a URL', () => {
+  // observedSecrets read credential *headers* only, so a token delivered as
+  // `?access_token=...` never entered the literal set -- and the literal set
+  // is what catches a value echoed back under a name no field list contains.
+  const TOKEN = 'a9f3c1e7b25d4086b1c4e7f20a5d8311';
+
+  test('is harvested from the request URL', () => {
+    const found = observedSecrets([['Host', 'target.example.test']], `https://target.example.test/api?access_token=${TOKEN}`);
+    assert.ok(found.includes(TOKEN));
+  });
+
+  test('is harvested from a URL carried in a header, query or fragment', () => {
+    for (const header of [
+      ['Referer', `https://target.example.test/cb?code=${TOKEN}`],
+      ['Location', `https://target.example.test/cb#access_token=${TOKEN}`],
+      ['Content-Location', `https://target.example.test/r?api_key=${TOKEN}`],
+    ] as const) {
+      const found = observedSecrets([header], 'https://target.example.test/api');
+      assert.ok(found.includes(TOKEN), header[0]);
+    }
+  });
+
+  test('is not harvested from an ordinary query parameter', () => {
+    const found = observedSecrets([['Host', 'target.example.test']], 'https://target.example.test/api?page=2&utm_source=mail');
+    assert.deepEqual(found, []);
+  });
+
+  test('is harvested in its decoded form as well as its raw one', () => {
+    const raw = 'abc%2Fdef%2Bghi%3D%3D0123456789';
+    const found = observedSecrets([['Host', 'h.example.test']], `https://h.example.test/a?token=${raw}`);
+    assert.ok(found.includes(raw));
+    assert.ok(found.includes(decodeURIComponent(raw)));
+  });
+});

@@ -281,7 +281,7 @@ export interface RenderOptions {
 export function renderExchange(exchange: Exchange, options: RenderOptions = {}): string {
   const redact = options.unsafeSendSecrets !== true;
   const limit = options.maxBodyChars ?? 4000;
-  const secrets = redact ? observedSecrets(exchange.request.headers) : [];
+  const secrets = redact ? observedSecrets(exchange.request.headers, exchange.request.url) : [];
   const scrub = (text: string): string =>
     redact ? redactText(text, { extraValues: secrets }) : text;
 

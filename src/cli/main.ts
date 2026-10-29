@@ -539,7 +539,7 @@ const showCommand: Command = {
     }
 
     const show = bool(parsed, 'unsafe-show-secrets');
-    const secrets = show ? [] : observedSecrets(exchange.request.headers);
+    const secrets = show ? [] : observedSecrets(exchange.request.headers, exchange.request.url);
     const scrub = (text: string): string => (show ? text : redactText(text, { extraValues: secrets }));
 
     if (!bool(parsed, 'response-only')) {
