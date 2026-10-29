@@ -1,0 +1,18 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Project files produced by a run: captured traffic, findings, CA material.
+# Never commit these -- a project file is a complete record of an
+# authenticated session against somebody's application.
+*.awb/
+projects/
+ca/
+*.pem
+*.key
+*.crt
+*.har
+
+.env
+.DS_Store
+coverage/

@@ -1,0 +1,52 @@
+{
+  "name": "appsec-workbench",
+  "version": "0.1.0",
+  "description": "A CLI web application security workbench: intercepting proxy, replay, fuzzing, passive and active checks, out-of-band canaries, a real browser, and an AI triage layer.",
+  "license": "MIT",
+  "author": "David Nichols",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "awb": "./dist/src/cli/main.js"
+  },
+  "exports": {
+    ".": "./dist/src/index.js"
+  },
+  "files": [
+    "dist/src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc --build tsconfig.json && chmod +x dist/src/cli/main.js",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "prepack": "npm run clean && npm run build"
+  },
+  "peerDependencies": {
+    "playwright": ">=1.40.0"
+  },
+  "peerDependenciesMeta": {
+    "playwright": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "playwright": "^1.56.1",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [
+    "security",
+    "appsec",
+    "proxy",
+    "mitm",
+    "fuzzing",
+    "web-security",
+    "pentesting",
+    "sarif"
+  ]
+}
