@@ -198,8 +198,8 @@ suite:
 
 ### Proxy
 
-HTTP and HTTPS, with certificates minted per host by `openssl` at handshake
-time and cached. WebSocket frames are decoded and recorded in both directions,
+HTTP and HTTPS, HTTP/1.1 and HTTP/2, with certificates minted per host by
+`openssl` at handshake time and cached. WebSocket frames are decoded and recorded in both directions,
 unmasked, with fragmented messages reassembled — a proxy that logs the upgrade
 handshake and then shows an opaque tunnel has recorded the least interesting
 part of a modern application.
@@ -208,6 +208,26 @@ Match-and-replace and session rules are the same declarative mechanism, so a
 session rule can do anything a replace rule can. Values may reference the
 environment — `{{env:BEARER}}` — so a rule file committed to a repository
 carries the shape of the session handling without the token.
+
+#### HTTP/2
+
+Clients are offered `h2` by ALPN, so a browser talks HTTP/2 to the proxy the
+way it would to the target. Upstream, the proxy speaks HTTP/2 when the target
+offers it and HTTP/1.1 when it does not, remembers which per origin, and tags
+an exchange that changed version on the way through. `--no-http2` turns it off.
+
+An HTTP/2 exchange is stored like any other: `:method`, `:scheme` and `:path`
+are the method and URL, and `:authority` is kept as a `host` header — the
+mapping RFC 9113 gives — so every check, diff and replay reads it unchanged.
+
+HTTP/2 is *not* byte-exact the way HTTP/1.1 is here, and it is worth being
+clear about why. An HTTP/2 request is an HPACK-encoded frame, not text, and
+Node's implementation validates fields as it encodes them. So the contract is
+the protocol's own: fields go out as given, in order, duplicates included,
+and what HTTP/2 forbids — connection headers, uppercase names, CR or LF in a
+value — is removed with a note saying so. The request recorded is the one that
+went out, not the one that was asked for. `awb replay --http2 --dry-run` shows
+the field list before anything is sent.
 
 #### Interception
 
@@ -501,10 +521,11 @@ pretending otherwise. Specifically:
 - **No GUI.** Interception happens in the terminal, one keystroke per
   decision, and editing happens in your own editor. If a point-and-click
   workflow with a request tree beside it is what you need, this is not it.
-- **No HTTP/2 or HTTP/3.** The proxy negotiates `http/1.1` by ALPN. Most of
-  what this tool exists to test is expressible over 1.1, and a deliberate
-  byte-level HTTP/2 test needs a different kind of client. An application
-  reachable only over h2 cannot be proxied by this.
+- **No HTTP/3, and HTTP/2 is field-exact rather than byte-exact.** HTTP/2
+  goes through Node's implementation, which refuses fields the protocol
+  forbids; a test that needs a deliberately malformed HTTP/2 frame needs a
+  different kind of client. WebSockets over HTTP/2 (RFC 8441) are not offered,
+  so browsers open them over HTTP/1.1, where they are recorded as before.
 - **No extension ecosystem.** It is a library as well as a CLI, so a check of
   your own is thirty lines of TypeScript, but there is no BApp Store.
 - **The active checks are not a scanner.** Eleven checks, each answering one

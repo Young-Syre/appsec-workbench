@@ -15,7 +15,8 @@ export * from './core/encoding.js';
 export * from './core/authorization.js';
 export { Project, type Finding, type Severity, type Confidence, severityRank, SEVERITY_ORDER } from './core/store.js';
 
-export { send, serialiseToWire, parseResponse, type SendOptions, type SendResult } from './net/send.js';
+export { send, serialiseToWire, parseResponse, asHttp1, asHttp2, type SendOptions, type SendResult } from './net/send.js';
+export { sendH2, toH2Fields, isHttp2, type H2Fields, type H2SendResult } from './net/h2.js';
 
 export { Proxy, startProxy, type ProxyOptions, type ProxyStats } from './proxy/server.js';
 export * from './proxy/ca.js';

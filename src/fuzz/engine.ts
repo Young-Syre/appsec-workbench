@@ -332,7 +332,7 @@ export async function fuzz(
     const result = await send(baseRequest, options);
     baselineExchange = {
       id: exchangeId(baseRequest, 'fuzz-baseline'),
-      request: baseRequest,
+      request: result.sent ?? baseRequest,
       ...(result.response === undefined ? {} : { response: result.response }),
       ...(result.error === undefined ? {} : { error: result.error }),
       source: 'fuzz',
@@ -409,7 +409,7 @@ export async function fuzz(
 
       const exchange: Exchange = {
         id: exchangeId(request, `fuzz:${index}`),
-        request,
+        request: result.sent ?? request,
         ...(result.response === undefined ? {} : { response: result.response }),
         ...(result.error === undefined ? {} : { error: result.error }),
         source: 'fuzz',

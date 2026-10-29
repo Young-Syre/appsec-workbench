@@ -24,10 +24,17 @@
 
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
+  createServer as createH2Server,
+  type Http2Server,
+  type Http2ServerRequest,
+  type Http2ServerResponse,
+} from 'node:http2';
+import {
   Server as TlsServer,
+  type TLSSocket,
   createSecureContext,
   connect as tlsConnect,
-  type TLSSocket,
+  type SecureContext,
 } from 'node:tls';
 import { connect as netConnect, type Socket } from 'node:net';
 import { EventEmitter } from 'node:events';
@@ -51,7 +58,8 @@ import { type ScopeConfig, decide } from '../core/scope.js';
 import { type Rule, applyRequestRules, applyResponseRules } from './rules.js';
 import { CertCache, type CaPaths, ensureCa } from './ca.js';
 import { FrameReader, isWebSocketUpgrade } from './websocket.js';
-import { send } from '../net/send.js';
+import { asHttp1, send } from '../net/send.js';
+import { isHttp2 } from '../net/h2.js';
 import type { Interceptor } from './intercept.js';
 import type { WebSocketFrame } from '../core/message.js';
 
@@ -73,6 +81,12 @@ export interface ProxyOptions {
    * one, nothing waits.
    */
   readonly interceptor?: Interceptor;
+  /**
+   * Offer HTTP/2 to clients. On by default: a browser talks HTTP/2 to the
+   * proxy, and the proxy talks HTTP/2 upstream when the target offers it and
+   * HTTP/1.1 when it does not.
+   */
+  readonly http2?: boolean;
   /** Do not verify upstream TLS. For a target with a self-signed certificate. */
   readonly insecureUpstream?: boolean;
   readonly maxBodyBytes?: number;
@@ -93,6 +107,21 @@ export interface ProxyStats {
 
 const CONNECT_HOST = Symbol('awb.connectHost');
 
+/**
+ * What `handle` needs from a response, which an HTTP/1.1 ServerResponse and
+ * an HTTP/2 compatibility response both are. Their overloads differ, so the
+ * two are not assignable to each other; this is the part they share.
+ */
+interface ClientResponse {
+  writeHead(status: number, headers?: Record<string, string | string[]>): unknown;
+  end(body?: string | Buffer): unknown;
+  on(event: 'close', listener: () => void): unknown;
+  destroy(): void;
+  readonly headersSent: boolean;
+  readonly destroyed: boolean;
+  readonly writableFinished: boolean;
+}
+
 interface TaggedSocket extends Socket {
   [CONNECT_HOST]?: string;
 }
@@ -102,7 +131,15 @@ export class Proxy extends EventEmitter {
   private readonly certs: CertCache;
   private readonly outer: Server;
   private readonly inner: Server;
-  private readonly tls: TlsServer;
+  private readonly alpn: string[];
+  /**
+   * One TLS server per CONNECT host, none of them listening. Each has that
+   * host's certificate as its default, for the handshake that sends no SNI.
+   */
+  private readonly tlsServers = new Map<string, TlsServer>();
+  private readonly h2: Http2Server;
+  /** Origins that answered an h2 offer with http/1.1, so they are not asked again. */
+  private readonly h1Only = new Set<string>();
   private readonly sockets = new Set<Socket>();
   readonly stats: ProxyStats = {
     recorded: 0,
@@ -133,26 +170,16 @@ export class Proxy extends EventEmitter {
       (socket as Socket).destroy();
     });
 
-    this.tls = new TlsServer({
-      SNICallback: (servername, cb) => {
-        try {
-          const pair = this.certs.for(servername);
-          this.stats.certsMinted = this.certs.minted;
-          cb(null, createSecureContext({ cert: pair.cert, key: pair.key }));
-        } catch (err) {
-          cb(err as Error);
-        }
-      },
+    // HTTP/2 after TLS termination. Driven by emit('connection') like the
+    // inner HTTP/1.1 server, and handled by the same code: Node's
+    // compatibility API gives an HTTP/2 stream the shape of a request.
+    this.h2 = createH2Server();
+    this.h2.on('request', (req, res) => {
+      void this.handle(req, res, true);
     });
-    this.tls.on('secureConnection', (tlsSocket: TLSSocket) => {
-      const host = (tlsSocket as unknown as { _parent?: TaggedSocket })._parent?.[CONNECT_HOST];
-      if (host !== undefined) (tlsSocket as unknown as TaggedSocket)[CONNECT_HOST] = host;
-      this.inner.emit('connection', tlsSocket);
-    });
-    this.tls.on('tlsClientError', (err) => {
-      // A browser probing for HTTP/2 or abandoning a handshake is routine.
-      this.options.onError?.(err as Error, 'tlsClientError');
-    });
+    this.h2.on('sessionError', (err) => this.options.onError?.(err, 'http2 session'));
+
+    this.alpn = options.http2 !== false ? ['h2', 'http/1.1'] : ['http/1.1'];
 
     this.outer = createHttpServer((req, res) => {
       void this.handle(req, res, false);
@@ -235,9 +262,79 @@ export class Proxy extends EventEmitter {
 
     socket.on('error', (err) => this.options.onError?.(err, 'connect socket'));
     socket.write('HTTP/1.1 200 Connection Established\r\nProxy-Agent: appsec-workbench\r\n\r\n');
-    (socket as TaggedSocket)[CONNECT_HOST] = `${rawHost}:${port}`;
     if (head.length > 0) socket.unshift(head);
-    this.tls.emit('connection', socket);
+    this.terminate(socket, rawHost, `${rawHost}:${port}`);
+  }
+
+  /**
+   * Terminate TLS on a tunnel scope has cleared.
+   *
+   * The certificate is chosen from SNI when the client sends it, and from the
+   * CONNECT host when it does not -- which is every browser talking to an IP
+   * address, since RFC 6066 forbids an IP literal in SNI. A single shared TLS
+   * server has no per-connection default, so a handshake without SNI found
+   * no certificate at all and the browser reported a cipher mismatch.
+   *
+   * The socket is handed to a `tls.Server` rather than wrapped by hand: a
+   * server-created socket is the one Node hands on cleanly to the HTTP/2
+   * session, including the client preface that arrives with the end of the
+   * handshake.
+   */
+  private terminate(socket: Socket, host: string, authority: string): void {
+    const bare = host.startsWith('[') ? host.slice(1, -1) : host;
+    let server: TlsServer;
+    try {
+      server = this.serverFor(bare);
+    } catch (err) {
+      this.options.onError?.(err as Error, 'minting a certificate');
+      socket.destroy();
+      return;
+    }
+    (socket as TaggedSocket)[CONNECT_HOST] = authority;
+    server.emit('connection', socket);
+  }
+
+  private serverFor(host: string): TlsServer {
+    const key = host.toLowerCase();
+    const hit = this.tlsServers.get(key);
+    if (hit !== undefined) return hit;
+    const fallback = this.certs.for(key);
+    this.stats.certsMinted = this.certs.minted;
+    const server = new TlsServer({
+      cert: fallback.cert,
+      key: fallback.key,
+      ALPNProtocols: this.alpn,
+      SNICallback: (servername, cb) => {
+        try {
+          cb(null, this.contextFor(servername));
+        } catch (err) {
+          cb(err as Error);
+        }
+      },
+    });
+    server.on('secureConnection', (tlsSocket: TLSSocket) => {
+      const tag = (tlsSocket as unknown as { _parent?: TaggedSocket })._parent?.[CONNECT_HOST];
+      if (tag !== undefined) (tlsSocket as unknown as TaggedSocket)[CONNECT_HOST] = tag;
+      if (tlsSocket.alpnProtocol === 'h2') this.h2.emit('connection', tlsSocket);
+      else this.inner.emit('connection', tlsSocket);
+    });
+    server.on('tlsClientError', (err) => {
+      // A browser probing or abandoning a handshake is routine.
+      this.options.onError?.(err, 'tlsClientError');
+    });
+    // Bounded like the certificate cache it mirrors.
+    if (this.tlsServers.size >= 256) {
+      const oldest = this.tlsServers.keys().next();
+      if (!oldest.done) this.tlsServers.delete(oldest.value);
+    }
+    this.tlsServers.set(key, server);
+    return server;
+  }
+
+  private contextFor(host: string): SecureContext {
+    const pair = this.certs.for(host);
+    this.stats.certsMinted = this.certs.minted;
+    return createSecureContext({ cert: pair.cert, key: pair.key });
   }
 
   /**
@@ -264,10 +361,11 @@ export class Proxy extends EventEmitter {
   // ---- requests ----------------------------------------------------------
 
   private async handle(
-    req: IncomingMessage,
-    res: ServerResponse,
+    req: IncomingMessage | Http2ServerRequest,
+    client: ServerResponse | Http2ServerResponse,
     secure: boolean,
   ): Promise<void> {
+    const res = client as ClientResponse;
     const url = this.absoluteUrl(req, secure);
     if (url === undefined) {
       res.writeHead(400, { 'content-type': 'text/plain' });
@@ -297,11 +395,12 @@ export class Proxy extends EventEmitter {
       return;
     }
 
+    const fromH2 = req.httpVersion.startsWith('2');
     const captured: HttpRequest = {
       method: req.method ?? 'GET',
       url,
-      httpVersion: req.httpVersion,
-      headers: proxyCleanHeaders(fromRawHeaders(req.rawHeaders)),
+      httpVersion: fromH2 ? '2' : req.httpVersion,
+      headers: fromH2 ? h2CapturedHeaders(req.rawHeaders) : proxyCleanHeaders(fromRawHeaders(req.rawHeaders)),
       body,
       startedAt: Date.now(),
     };
@@ -351,11 +450,31 @@ export class Proxy extends EventEmitter {
       if (res.destroyed) return;
     }
 
-    const result = await send(request, {
+    const sendOptions = {
       timeoutMs: this.options.timeoutMs ?? 30_000,
       ...(this.options.insecureUpstream === true ? { insecure: true } : {}),
       maxBodyBytes: this.options.maxBodyBytes ?? 32 * 1024 * 1024,
-    });
+    };
+    // HTTP/2 upstream when the client spoke it and the target offers it.
+    // A target that answers the offer with http/1.1 is remembered, so the
+    // cost of asking is paid once per origin rather than once per request.
+    const origin = originOf(request.url);
+    const downgradeNote: string[] = [];
+    if (isHttp2(request) && (this.h1Only.has(origin) || !request.url.startsWith('https:'))) {
+      request = asHttp1(request);
+      downgradeNote.push('note:sent over HTTP/1.1; the client spoke HTTP/2 and the target does not offer it');
+    }
+    let result = await send(request, sendOptions);
+    if ((result as { refusedH2?: boolean }).refusedH2 === true) {
+      this.h1Only.add(origin);
+      request = asHttp1(request);
+      downgradeNote.push('note:sent over HTTP/1.1; the client spoke HTTP/2 and the target does not offer it');
+      result = await send(request, sendOptions);
+    }
+    // What was recorded is what went out: HTTP/2 can only send a request
+    // after removing what the protocol forbids, and `sent` is that request.
+    request = result.sent ?? request;
+    interceptTags.push(...downgradeNote);
 
     const id = exchangeId(request, String(this.stats.recorded));
 
@@ -421,7 +540,7 @@ export class Proxy extends EventEmitter {
       res.destroy();
       return;
     }
-    this.writeResponse(res, delivered, id);
+    this.writeResponse(client, delivered, id);
   }
 
   /**
@@ -431,13 +550,23 @@ export class Proxy extends EventEmitter {
    * actually hold. The stored exchange keeps the originals; this copy only
    * has to be parseable.
    */
-  private writeResponse(res: ServerResponse, response: HttpResponse, id: string): void {
+  private writeResponse(
+    res: ServerResponse | Http2ServerResponse,
+    response: HttpResponse,
+    id: string,
+  ): void {
     let headers: HeaderList = response.headers.filter(([k]) => !isHopByHop(k));
     headers = removeHeader(headers, 'content-length');
     headers = setHeader(headers, 'content-length', String(response.body.length));
     headers = setHeader(headers, 'x-awb-exchange', id);
     try {
-      res.writeHead(response.status, response.statusText || undefined, toRawHeaders(headers));
+      if ('stream' in res) {
+        // HTTP/2 to the client: no status text, lowercase names, nothing
+        // connection-specific, and repeated names as arrays.
+        res.writeHead(response.status, toH2ResponseHeaders(headers));
+      } else {
+        (res as ServerResponse).writeHead(response.status, response.statusText || undefined, toRawHeaders(headers));
+      }
       res.end(response.body);
     } catch (err) {
       this.options.onError?.(err as Error, 'writing response');
@@ -596,7 +725,7 @@ export class Proxy extends EventEmitter {
    * Host would let a request retarget itself to another host inside somebody
    * else's tunnel.
    */
-  private absoluteUrl(req: IncomingMessage, secure: boolean): string | undefined {
+  private absoluteUrl(req: IncomingMessage | Http2ServerRequest, secure: boolean): string | undefined {
     const target = req.url ?? '';
     if (/^https?:\/\//i.test(target)) return target;
 
@@ -644,11 +773,52 @@ function proxyCleanKeepUpgrade(headers: HeaderList): HeaderList {
   });
 }
 
+/**
+ * Headers of a request that arrived over HTTP/2, in this tool's
+ * representation: `:authority` becomes `host` (RFC 9113 section 8.3.1), the
+ * other pseudo-header fields are already the method and URL, and order is
+ * otherwise kept.
+ */
+function h2CapturedHeaders(raw: readonly string[]): HeaderList {
+  const out: [string, string][] = [];
+  let authority: string | undefined;
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    const name = raw[i] as string;
+    const value = raw[i + 1] as string;
+    if (name === ':authority') authority = value;
+    else if (!name.startsWith(':') && !isHopByHop(name)) out.push([name, value]);
+  }
+  const hasHost = out.some(([k]) => k === 'host');
+  return authority === undefined || hasHost ? out : [['host', authority], ...out];
+}
+
+/** Headers for an HTTP/2 response to the client. */
+function toH2ResponseHeaders(headers: HeaderList): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const [name, value] of headers) {
+    const lower = name.toLowerCase();
+    if (lower === 'keep-alive' || lower === 'proxy-connection' || lower.startsWith(':')) continue;
+    const existing = out[lower];
+    if (existing === undefined) out[lower] = value;
+    else if (Array.isArray(existing)) existing.push(value);
+    else out[lower] = [existing, value];
+  }
+  return out;
+}
+
+function originOf(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return url;
+  }
+}
+
 function tagsFor(applied: readonly { ruleId: string }[]): string[] {
   return [...new Set(applied.map((a) => `rule:${a.ruleId}`))];
 }
 
-async function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
+async function readBody(req: AsyncIterable<unknown>, limit: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {

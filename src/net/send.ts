@@ -23,6 +23,7 @@ import {
   serialiseHeaders,
 } from '../core/headers.js';
 import { type HttpRequest, type HttpResponse, requestLine } from '../core/message.js';
+import { isHttp2, sendH2 } from './h2.js';
 
 export interface SendOptions {
   /** Milliseconds to wait for the whole exchange. */
@@ -55,6 +56,12 @@ export interface SendResult {
   /** Response anomalies the parser noticed. */
   readonly notes: readonly string[];
   readonly truncated: boolean;
+  /**
+   * The request as it actually went out, when that differs from the one
+   * passed in. Only HTTP/2 sets it, because only HTTP/2 has to change a
+   * request to send it at all.
+   */
+  readonly sent?: HttpRequest;
 }
 
 const DEFAULT_TIMEOUT = 20_000;
@@ -259,6 +266,10 @@ export async function send(
   request: HttpRequest,
   options: SendOptions = {},
 ): Promise<SendResult> {
+  // The version on the request decides the protocol. A request captured over
+  // HTTP/2 replays over HTTP/2, and `--http1` or an edited request line is
+  // how it is sent the other way.
+  if (isHttp2(request)) return sendH2(request, options);
   const wire = serialiseToWire(request, options);
   const notes: string[] = [];
 
@@ -401,4 +412,35 @@ function isComplete(parsed: ParsedResponse, buf: Buffer): boolean {
     return buf.length - bodyStart >= declared;
   }
   return false;
+}
+
+/**
+ * The same request, for HTTP/1.1.
+ *
+ * What a proxy does when the browser spoke HTTP/2 and the target does not.
+ * The authority is already a Host header in this tool's representation, so
+ * this is a change of version and one more thing: HTTP/2 lets a client split
+ * Cookie into one field per cookie, and RFC 9113 section 8.2.3 requires those
+ * to be joined with "; " before the request goes to an HTTP/1.1 server, which
+ * is entitled to read only the first Cookie header. Nothing else is touched.
+ */
+export function asHttp1(request: HttpRequest): HttpRequest {
+  const cookies = request.headers.filter(([k]) => k.toLowerCase() === 'cookie');
+  if (cookies.length < 2) return { ...request, httpVersion: '1.1' };
+  const joined = cookies.map(([, v]) => v).join('; ');
+  const headers: [string, string][] = [];
+  let placed = false;
+  for (const [k, v] of request.headers) {
+    if (k.toLowerCase() !== 'cookie') headers.push([k, v]);
+    else if (!placed) {
+      headers.push([k, joined]);
+      placed = true;
+    }
+  }
+  return { ...request, httpVersion: '1.1', headers };
+}
+
+/** The same request, for HTTP/2. Fields HTTP/2 forbids are dropped on send, with notes. */
+export function asHttp2(request: HttpRequest): HttpRequest {
+  return { ...request, httpVersion: '2' };
 }

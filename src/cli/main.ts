@@ -48,6 +48,8 @@ import { InterceptConsole, attachToTerminal, systemEditor } from './intercept-ui
 import { serialiseRequest, serialiseResponse } from '../core/message.js';
 import { redactHeaders, redactText, redactUrl, observedSecrets } from '../core/redact.js';
 import { buildReplayRequest, parseMutation, replay, toEditable } from '../replay/replay.js';
+import { asHttp1, asHttp2 } from '../net/send.js';
+import { isHttp2, toH2Fields } from '../net/h2.js';
 import { diffResponses } from '../replay/diff.js';
 import { autoMarkQuery, fuzz, groupResults } from '../fuzz/engine.js';
 import { BUILTIN_SETS, parsePayloadSpec, parseProcessor } from '../fuzz/payloads.js';
@@ -294,6 +296,7 @@ const proxyCommand: Command = {
     host: { type: 'string', describe: 'Listen address (default 127.0.0.1)', placeholder: 'addr' },
     rules: { type: 'string', describe: 'Match-and-replace rules, as JSON', placeholder: 'file' },
     'insecure-upstream': { type: 'boolean', describe: 'Do not verify the target\'s TLS certificate' },
+    http2: { type: 'boolean', describe: 'Offer HTTP/2 to clients (default on; --no-http2 to stop)' },
     intercept: { type: 'boolean', describe: 'Hold each in-scope request to forward, edit or drop' },
     'intercept-responses': { type: 'boolean', describe: 'Hold responses as well (implies --intercept)' },
     'intercept-url': { type: 'string', describe: 'Only hold URLs matching this regex', placeholder: 're' },
@@ -372,6 +375,7 @@ const proxyCommand: Command = {
       rules,
       ...(bool(parsed, 'insecure-upstream') ? { insecureUpstream: true } : {}),
       ...(interceptor === undefined ? {} : { interceptor }),
+      http2: parsed.options['http2'] !== false,
       onExchange: (exchange) => {
         project.append(exchange);
         if (!bool(parsed, 'quiet')) {
@@ -580,6 +584,8 @@ const replayCommand: Command = {
     edit: { type: 'boolean', describe: 'Print the editable form and exit' },
     'fix-length': { type: 'boolean', describe: 'Recompute Content-Length before sending' },
     insecure: { type: 'boolean', describe: 'Do not verify the target\'s TLS certificate' },
+    http2: { type: 'boolean', describe: 'Send over HTTP/2, whatever it was captured over' },
+    http1: { type: 'boolean', describe: 'Send over HTTP/1.1, whatever it was captured over' },
   },
   detail: [
     'Mutations:',
@@ -597,6 +603,11 @@ const replayCommand: Command = {
     '',
     'Content-Length is not recomputed unless you pass --fix-length. A length that',
     'disagrees with the body is frequently the test.',
+    '',
+    'A request replays over the version it was captured with. --http2 and --http1',
+    'switch it. HTTP/2 cannot carry everything HTTP/1.1 can -- connection headers,',
+    'CR or LF in a value -- and what it cannot carry is dropped with a note;',
+    '--dry-run shows the HTTP/2 fields before anything is sent.',
   ].join('\n'),
   async run(argv) {
     const parsed = parse(argv, this.specs);
@@ -614,6 +625,15 @@ const replayCommand: Command = {
       return EXIT_OK;
     }
 
+    if (bool(parsed, 'http2') && bool(parsed, 'http1')) {
+      throw new UsageError('--http2 and --http1 contradict each other');
+    }
+    const base = bool(parsed, 'http2')
+      ? asHttp2(original.request)
+      : bool(parsed, 'http1')
+        ? asHttp1(original.request)
+        : original.request;
+
     const mutations = list(parsed, 'set').map(parseMutation);
     const rawPath = str(parsed, 'raw');
     const options = {
@@ -625,9 +645,19 @@ const replayCommand: Command = {
     };
 
     if (bool(parsed, 'dry-run')) {
-      const { request, applied } = buildReplayRequest(original.request, options);
+      const { request, applied } = buildReplayRequest(base, options);
       for (const a of applied) log(parsed, `applied: ${a}`);
       const show = bool(parsed, 'unsafe-show-secrets');
+      if (isHttp2(request)) {
+        // No request line to print: show the field list HTTP/2 will carry,
+        // and what it had to leave out.
+        const { fields, notes } = toH2Fields(request);
+        const scrubbed = show ? fields : redactHeaders(fields);
+        out(show ? scrubbed.map(([k, v]) => `${k}: ${v}`).join('\n') : redactText(scrubbed.map(([k, v]) => `${k}: ${v}`).join('\n')));
+        if (request.body.length > 0) out(`\n${show ? request.body.toString('utf8') : redactText(request.body.toString('utf8'))}`);
+        for (const note of notes) log(parsed, `note: ${note}`);
+        return EXIT_OK;
+      }
       out(
         show
           ? serialiseRequest(request)
@@ -638,7 +668,7 @@ const replayCommand: Command = {
       return EXIT_OK;
     }
 
-    const result = await replay(original.request, options, original.id);
+    const result = await replay(base, options, original.id);
     project.append(result.exchange);
     for (const a of result.applied) log(parsed, `applied: ${a}`);
     for (const note of result.notes) log(parsed, `note: ${note}`);

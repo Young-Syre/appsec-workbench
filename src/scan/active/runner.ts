@@ -327,7 +327,7 @@ export class ActiveSender {
     const result = await send(request, this.sendOptions);
     const exchange: Exchange = {
       id: exchangeId(request, `active:${tag}:${this.spent}`),
-      request,
+      request: result.sent ?? request,
       ...(result.response === undefined ? {} : { response: result.response }),
       ...(result.error === undefined ? {} : { error: result.error }),
       source: 'active-scan',

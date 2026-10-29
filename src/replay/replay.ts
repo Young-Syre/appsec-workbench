@@ -337,7 +337,9 @@ export async function replay(
 
   const exchange: Exchange = {
     id,
-    request,
+    // What went out. Over HTTP/2 that can differ from what was asked for,
+    // and the notes say how.
+    request: result.sent ?? request,
     ...(result.response === undefined ? {} : { response: result.response }),
     ...(result.error === undefined ? {} : { error: result.error }),
     source: 'replay',
