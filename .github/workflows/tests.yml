@@ -1,0 +1,253 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22', '24']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # openssl is what mints the interception certificates. The proxy tests
+      # fail without it, so it is worth asserting rather than discovering.
+      - name: openssl is present
+        run: openssl version
+
+      - name: Install
+        run: npm ci
+
+      # Playwright is an optional peer dependency and only `awb browse` needs
+      # it. Its browser is installed here so the real-browser integration test
+      # runs rather than skipping, which is the whole point of having it.
+      - name: Install Chromium for the browser tests
+        run: npx playwright install --with-deps chromium
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: The version in code matches package.json
+        run: |
+          code=$(node dist/src/cli/main.js --version)
+          pkg=$(node -p "require('./package.json').version")
+          test "$code" = "$pkg" || { echo "CLI says $code, package.json says $pkg"; exit 1; }
+          echo "version $code"
+
+      # The claim the whole tool rests on. Asserted from the command line as
+      # well as from the suite, because this is the one that must never regress.
+      - name: Scope is deny by default
+        run: |
+          set -e
+          dir=$(mktemp -d)/p.awb
+          node dist/src/cli/main.js init "$dir"
+          set +e
+          node dist/src/cli/main.js proxy --port 0 -p "$dir"
+          code=$?
+          set -e
+          test "$code" -eq 4 || { echo "a scopeless proxy must exit 4, got $code"; exit 1; }
+          echo "ok: the proxy refuses to start without scope"
+
+      - name: Active checks refuse without an authorisation record
+        run: |
+          set -e
+          dir=$(mktemp -d)/p.awb
+          node dist/src/cli/main.js init "$dir"
+          node dist/src/cli/main.js scope add target.example -p "$dir"
+          set +e
+          out=$(node dist/src/cli/main.js scan --active -p "$dir" 2>&1)
+          code=$?
+          set -e
+          test "$code" -eq 4 || { echo "expected exit 4, got $code: $out"; exit 1; }
+          echo "$out" | grep -q 'awb auth set' || { echo "the refusal must say how to fix it"; exit 1; }
+          echo "ok: active checks fail closed"
+
+      - name: An expired authorisation fails closed
+        run: |
+          set -e
+          dir=$(mktemp -d)/p.awb
+          node dist/src/cli/main.js init "$dir"
+          node dist/src/cli/main.js auth set --engagement Over --by someone \
+            --from 2020-01-01 --until 2020-01-02 --ref r -p "$dir"
+          set +e
+          node dist/src/cli/main.js auth show -p "$dir" > /dev/null
+          code=$?
+          set -e
+          test "$code" -eq 4 || { echo "an expired record must exit 4, got $code"; exit 1; }
+          echo "ok: expiry is enforced"
+
+      - name: Exit codes are what the README says
+        run: |
+          set -e
+          check() {
+            desc="$1"; expected="$2"; shift 2
+            set +e
+            "$@" > /dev/null 2>&1
+            actual=$?
+            set -e
+            test "$actual" -eq "$expected" || { echo "$desc: expected $expected, got $actual"; exit 1; }
+            echo "ok (exit $expected) $desc"
+          }
+          dir=$(mktemp -d)/p.awb
+          node dist/src/cli/main.js init "$dir"
+          node dist/src/cli/main.js scope add target.example -p "$dir"
+          check "help exits 0" 0 node dist/src/cli/main.js --help
+          check "no command exits 2" 2 node dist/src/cli/main.js
+          check "unknown command exits 2" 2 node dist/src/cli/main.js nonsense
+          check "unknown option exits 2" 2 node dist/src/cli/main.js ls --nope -p "$dir"
+          check "a clean scan exits 0" 0 node dist/src/cli/main.js scan -p "$dir"
+          check "an unknown exchange exits 3" 3 node dist/src/cli/main.js show deadbeef -p "$dir"
+          check "an out-of-scope url exits 1" 1 node dist/src/cli/main.js scope check https://elsewhere.example/ -p "$dir"
+
+      - name: The production dependency set is empty
+        run: |
+          deps=$(node -p "JSON.stringify(require('./package.json').dependencies ?? {})")
+          test "$deps" = '{}' || { echo "runtime dependencies appeared: $deps"; exit 1; }
+          echo "ok: no runtime dependencies"
+
+      - name: Every registered check is reachable and documented
+        run: |
+          node --input-type=module -e "
+          import { PASSIVE_CHECKS, ACTIVE_CHECKS } from './dist/src/index.js';
+          const all = [...PASSIVE_CHECKS, ...ACTIVE_CHECKS];
+          const ids = new Set();
+          for (const c of all) {
+            if (ids.has(c.id)) throw new Error(c.id + ' is registered twice');
+            ids.add(c.id);
+            if (!/^AWB-[PA]\d{3}\$/.test(c.id)) throw new Error(c.id + ' is malformed');
+            if ((c.description ?? '').length < 60) throw new Error(c.id + ' has no real description');
+          }
+          console.log(PASSIVE_CHECKS.length + ' passive, ' + ACTIVE_CHECKS.length + ' active');
+          "
+
+      - name: Every check in the README table exists, and every check is in the table
+        run: |
+          node --input-type=module -e "
+          import { readFileSync } from 'node:fs';
+          import { PASSIVE_CHECKS, ACTIVE_CHECKS } from './dist/src/index.js';
+          const readme = readFileSync('README.md', 'utf8');
+          const documented = new Set((readme.match(/AWB-[PA]\d{3}/g) ?? []));
+          const registered = new Set([...PASSIVE_CHECKS, ...ACTIVE_CHECKS].map((c) => c.id));
+          for (const id of registered) {
+            if (!documented.has(id)) throw new Error(id + ' is not in the README');
+          }
+          for (const id of documented) {
+            if (!registered.has(id)) throw new Error(id + ' is in the README but not registered');
+          }
+          console.log(registered.size + ' checks, all documented');
+          "
+
+      # Redaction is the promise most likely to be broken by a later change,
+      # because it has to hold in four renderers and in the AI prompt builder.
+      - name: No reporter and no prompt carries a captured credential
+        run: |
+          node --input-type=module -e "
+          import { render } from './dist/src/report/index.js';
+          import { renderExchange } from './dist/src/ai/client.js';
+          import { buildTriageRequest } from './dist/src/ai/tasks.js';
+
+          const SECRET = 'a9f3c1e7b25d4086b1c4e7f20a5d8311';
+          const request = {
+            method: 'GET',
+            url: 'https://target.example/api/me?session=' + SECRET,
+            httpVersion: '1.1',
+            headers: [['Host', 'target.example'], ['Cookie', 'session=' + SECRET]],
+            body: Buffer.alloc(0),
+            startedAt: 0,
+          };
+          const exchange = {
+            id: 'aaaabbbbccccdddd',
+            request,
+            response: {
+              status: 200, statusText: 'OK', httpVersion: '1.1',
+              headers: [['Content-Type', 'application/json']],
+              body: Buffer.from(JSON.stringify({ echo: SECRET })),
+              elapsedMs: 1,
+            },
+            source: 'proxy', tags: [],
+          };
+          const finding = {
+            id: 'f', check: 'AWB-P020', title: 'test', severity: 'high', confidence: 'firm',
+            evidence: ['aaaabbbbccccdddd'],
+            detail: 'the cookie session=' + SECRET + ' was accepted',
+            remediation: 'r', url: request.url, at: 0,
+          };
+          const exchanges = new Map([[exchange.id, exchange]]);
+          for (const format of ['text', 'json', 'markdown', 'sarif']) {
+            const outText = render(format, [finding], { exchanges });
+            if (outText.includes(SECRET)) throw new Error(format + ' leaked the credential');
+          }
+          if (renderExchange(exchange).includes(SECRET)) throw new Error('renderExchange leaked it');
+          const prompt = JSON.stringify(buildTriageRequest(finding, [exchange]));
+          if (prompt.includes(SECRET)) throw new Error('the AI prompt leaked it');
+          if (!render('text', [finding], { exchanges, showSecrets: true }).includes(SECRET)) {
+            throw new Error('--unsafe-show-secrets stopped working, so the test proves nothing');
+          }
+          console.log('ok: four renderers and the prompt builder, all clean');
+          "
+
+      - name: SARIF declares every rule it references and locates every result
+        run: |
+          node --input-type=module -e "
+          import { renderSarif, PASSIVE_CHECKS, ACTIVE_CHECKS } from './dist/src/index.js';
+          const findings = [...PASSIVE_CHECKS, ...ACTIVE_CHECKS].map((c, i) => ({
+            id: 'f' + i, check: c.id, title: c.title, severity: 'medium', confidence: 'firm',
+            evidence: ['aaaabbbbccccdddd'], detail: 'd', remediation: 'r',
+            url: 'https://target.example/', at: 0,
+          }));
+          const doc = JSON.parse(renderSarif(findings));
+          if (doc.version !== '2.1.0') throw new Error('wrong SARIF version');
+          const run = doc.runs[0];
+          const declared = new Map(run.tool.driver.rules.map((r, i) => [r.id, i]));
+          for (const result of run.results) {
+            if (!declared.has(result.ruleId)) throw new Error(result.ruleId + ' referenced but not declared');
+            if (declared.get(result.ruleId) !== result.ruleIndex) throw new Error('ruleIndex is wrong for ' + result.ruleId);
+            if (result.locations.length !== 1) throw new Error(result.ruleId + ' has no location');
+            if (!result.locations[0].physicalLocation.artifactLocation.uri) throw new Error('empty uri');
+          }
+          for (const rule of run.tool.driver.rules) {
+            if (rule.fullDescription.text.includes('No description is registered')) {
+              throw new Error(rule.id + ' is not in the registry');
+            }
+          }
+          console.log(run.results.length + ' results, ' + run.tool.driver.rules.length + ' rules, all declared and located');
+          "
+
+      # A capture is evidence and the directory is the artefact. If any of these
+      # ever got committed, the mistake would be permanent.
+      - name: Nothing that could hold a capture or a key is tracked
+        run: |
+          set -e
+          if git ls-files | grep -E '\.awb/|\.pem$|\.key$|\.crt$|\.har$|^ca/'; then
+            echo "a capture, a certificate or a key is tracked"
+            exit 1
+          fi
+          for pattern in '*.awb/' '*.pem' '*.key' '*.crt' '*.har'; do
+            grep -qF "$pattern" .gitignore || { echo ".gitignore is missing $pattern"; exit 1; }
+          done
+          echo "ok: nothing committed, and the patterns are ignored"
+
+      - name: The authorised-testing notice is where someone will read it
+        run: |
+          node dist/src/cli/main.js --help | grep -q 'Authorised testing only' \
+            || { echo "the notice is missing from the CLI help"; exit 1; }
+          grep -q 'Authorised testing only' README.md \
+            || { echo "the notice is missing from the README"; exit 1; }
+          echo "ok"
