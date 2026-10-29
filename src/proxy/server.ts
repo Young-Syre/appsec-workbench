@@ -52,6 +52,7 @@ import { type Rule, applyRequestRules, applyResponseRules } from './rules.js';
 import { CertCache, type CaPaths, ensureCa } from './ca.js';
 import { FrameReader, isWebSocketUpgrade } from './websocket.js';
 import { send } from '../net/send.js';
+import type { Interceptor } from './intercept.js';
 import type { WebSocketFrame } from '../core/message.js';
 
 export interface ProxyOptions {
@@ -67,6 +68,11 @@ export interface ProxyOptions {
   /** Called for traffic that was tunnelled without interception. */
   readonly onTunnel?: (host: string, reason: string) => void;
   readonly onError?: (err: Error, context: string) => void;
+  /**
+   * Hold in-scope messages for a person to forward, edit or drop. Without
+   * one, nothing waits.
+   */
+  readonly interceptor?: Interceptor;
   /** Do not verify upstream TLS. For a target with a self-signed certificate. */
   readonly insecureUpstream?: boolean;
   readonly maxBodyBytes?: number;
@@ -81,6 +87,8 @@ export interface ProxyStats {
   failed: number;
   frames: number;
   certsMinted: number;
+  /** Requests the operator dropped at the intercept, so never sent. */
+  dropped: number;
 }
 
 const CONNECT_HOST = Symbol('awb.connectHost');
@@ -103,6 +111,7 @@ export class Proxy extends EventEmitter {
     failed: 0,
     frames: 0,
     certsMinted: 0,
+    dropped: 0,
   };
   private listeningPort = 0;
 
@@ -193,6 +202,10 @@ export class Proxy extends EventEmitter {
    * difference between a test suite that exits and one that hangs.
    */
   async close(): Promise<void> {
+    // Anything parked at the intercept is released first, so its handler
+    // runs to completion against a socket that is about to go, rather than
+    // waiting on a decision nobody will now make.
+    this.options.interceptor?.releaseAll();
     for (const socket of this.sockets) socket.destroy();
     this.sockets.clear();
     this.outer.closeAllConnections?.();
@@ -293,11 +306,50 @@ export class Proxy extends EventEmitter {
       startedAt: Date.now(),
     };
 
-    const { message: request, applied } = applyRequestRules(
+    const { message: ruled, applied } = applyRequestRules(
       this.options.rules ?? [],
       captured,
       this.options.env,
     );
+
+    // The client's connection, as a signal: a request held at the intercept
+    // for a browser that has hung up should leave the queue, not wait there.
+    const clientGone = new AbortController();
+    res.on('close', () => {
+      if (!res.writableFinished) clientGone.abort();
+    });
+
+    const interceptTags: string[] = [];
+    let request = ruled;
+    const interceptor = this.options.interceptor;
+    if (interceptor !== undefined) {
+      const decision = await interceptor.holdRequest(ruled, clientGone.signal);
+      if (decision.by === 'timeout') interceptTags.push('intercept:timeout');
+      if (decision.action === 'drop') {
+        if (decision.by !== 'abandoned') this.stats.dropped += 1;
+        if (!res.headersSent && !res.destroyed) {
+          res.writeHead(502, { 'content-type': 'text/plain', 'x-awb-intercept': 'dropped' });
+          res.end('appsec-workbench: the request was dropped at the intercept and never sent.\n');
+        }
+        return;
+      }
+      if (decision.request !== undefined) {
+        // An edit can change the target. The edited request is a new request
+        // as far as scope is concerned, and is asked about as one.
+        const edited = decide(this.options.scope, decision.request.url);
+        if (edited.verdict !== 'in-scope') {
+          this.stats.blocked += 1;
+          res.writeHead(403, { 'content-type': 'text/plain', 'x-awb-scope': edited.verdict });
+          res.end(
+            `appsec-workbench refused the edited request.\n\n  ${decision.request.url}\n  ${edited.reason}\n`,
+          );
+          return;
+        }
+        request = decision.request;
+        interceptTags.push('intercept:edited');
+      }
+      if (res.destroyed) return;
+    }
 
     const result = await send(request, {
       timeoutMs: this.options.timeoutMs ?? 30_000,
@@ -314,7 +366,7 @@ export class Proxy extends EventEmitter {
         request,
         error: result.error ?? 'the request failed for an unstated reason',
         source: 'proxy',
-        tags: tagsFor(applied),
+        tags: [...tagsFor(applied), ...interceptTags],
       };
       this.options.onExchange?.(exchange);
       this.emit('exchange', exchange);
@@ -332,18 +384,44 @@ export class Proxy extends EventEmitter {
       this.options.env,
     );
 
+    // The response can be held too. What is recorded is the response as it
+    // arrived; an edit changes only what the browser is handed, and the tag
+    // says so, because the evidence is the upstream bytes.
+    let delivered = response;
+    if (interceptor !== undefined && !res.destroyed) {
+      const decision = await interceptor.holdResponse(request, response, clientGone.signal);
+      if (decision.by === 'timeout') interceptTags.push('intercept:response-timeout');
+      if (decision.action === 'drop') {
+        interceptTags.push('intercept:response-dropped');
+      } else if (decision.response !== undefined) {
+        delivered = decision.response;
+        interceptTags.push('intercept:response-edited');
+      }
+    }
+
     const exchange: Exchange = {
       id,
       request,
       response,
       source: 'proxy',
-      tags: [...tagsFor(applied), ...tagsFor(responseApplied), ...result.notes.map((n) => `note:${n}`)],
+      tags: [
+        ...tagsFor(applied),
+        ...tagsFor(responseApplied),
+        ...interceptTags,
+        ...result.notes.map((n) => `note:${n}`),
+      ],
     };
     this.stats.recorded += 1;
     this.options.onExchange?.(exchange);
     this.emit('exchange', exchange);
 
-    this.writeResponse(res, response, id);
+    if (interceptTags.includes('intercept:response-dropped')) {
+      // A dropped response is a connection the browser sees fail. The
+      // exchange is still recorded: the request was sent and this came back.
+      res.destroy();
+      return;
+    }
+    this.writeResponse(res, delivered, id);
   }
 
   /**

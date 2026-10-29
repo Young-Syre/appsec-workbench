@@ -43,6 +43,8 @@ import { NotAuthorised, checkAuthorisation, parseAuthorisation } from '../core/a
 import { Proxy } from '../proxy/server.js';
 import { caExists, caFingerprint, caPaths, caSubject, caValidTo, ensureCa, opensslVersion, trustInstructions } from '../proxy/ca.js';
 import { validateRules, type Rule } from '../proxy/rules.js';
+import { Interceptor } from '../proxy/intercept.js';
+import { InterceptConsole, attachToTerminal, systemEditor } from './intercept-ui.js';
 import { serialiseRequest, serialiseResponse } from '../core/message.js';
 import { redactHeaders, redactText, redactUrl, observedSecrets } from '../core/redact.js';
 import { buildReplayRequest, parseMutation, replay, toEditable } from '../replay/replay.js';
@@ -285,13 +287,19 @@ const caCommand: Command = {
 const proxyCommand: Command = {
   name: 'proxy',
   summary: 'Run the intercepting proxy',
-  usage: 'awb proxy [--port 8080] [--rules rules.json]',
+  usage: 'awb proxy [--port 8080] [--rules rules.json] [--intercept]',
   specs: {
     ...COMMON,
     port: { type: 'number', describe: 'Listen port (default 8080)', placeholder: 'n' },
     host: { type: 'string', describe: 'Listen address (default 127.0.0.1)', placeholder: 'addr' },
     rules: { type: 'string', describe: 'Match-and-replace rules, as JSON', placeholder: 'file' },
     'insecure-upstream': { type: 'boolean', describe: 'Do not verify the target\'s TLS certificate' },
+    intercept: { type: 'boolean', describe: 'Hold each in-scope request to forward, edit or drop' },
+    'intercept-responses': { type: 'boolean', describe: 'Hold responses as well (implies --intercept)' },
+    'intercept-url': { type: 'string', describe: 'Only hold URLs matching this regex', placeholder: 're' },
+    'intercept-method': { type: 'string', describe: 'Only hold methods matching this regex', placeholder: 're' },
+    'intercept-timeout': { type: 'number', describe: 'Seconds a held message waits (default 120)', placeholder: 's' },
+    'intercept-on-timeout': { type: 'string', describe: 'forward (default) or drop, when a hold times out', placeholder: 'act' },
   },
   detail: [
     'Out-of-scope CONNECTs are tunnelled without interception: no certificate is',
@@ -301,6 +309,12 @@ const proxyCommand: Command = {
     '',
     'Listens on loopback. Binding elsewhere offers a man in the middle to anyone',
     'who can reach the port.',
+    '',
+    '--intercept holds each in-scope request until you decide: f forward, e edit',
+    'in $EDITOR, d drop, i interception on/off, r responses on/off. Out-of-scope',
+    'traffic is never held. An edited request is scope-checked again before it',
+    'is sent, and nothing in it is recomputed unless you choose to correct a',
+    'Content-Length the edit made wrong. Needs a terminal.',
   ].join('\n'),
   async run(argv) {
     const parsed = parse(argv, this.specs);
@@ -327,6 +341,27 @@ const proxyCommand: Command = {
       }
     }
 
+    const interceptor = buildInterceptor(parsed);
+    if (interceptor !== undefined && !process.stdin.isTTY) {
+      process.stderr.write(
+        '--intercept needs a terminal to take keystrokes from, and stdin is not one.\n' +
+          'For unattended changes to traffic, use --rules.\n',
+      );
+      return EXIT_INPUT;
+    }
+    const console_ =
+      interceptor === undefined
+        ? undefined
+        : new InterceptConsole(
+            interceptor,
+            { write: (text) => process.stderr.write(text), edit: systemEditor() },
+            { showSecrets: bool(parsed, 'unsafe-show-secrets') },
+          );
+    const say = (line: string): void => {
+      if (console_ === undefined) process.stderr.write(`${line}\n`);
+      else console_.log(line);
+    };
+
     const caDir = join(dir, 'ca');
     const ca = ensureCa(caDir);
     const proxy = new Proxy({
@@ -336,6 +371,7 @@ const proxyCommand: Command = {
       ca,
       rules,
       ...(bool(parsed, 'insecure-upstream') ? { insecureUpstream: true } : {}),
+      ...(interceptor === undefined ? {} : { interceptor }),
       onExchange: (exchange) => {
         project.append(exchange);
         if (!bool(parsed, 'quiet')) {
@@ -343,15 +379,17 @@ const proxyCommand: Command = {
           const url = bool(parsed, 'unsafe-show-secrets')
             ? exchange.request.url
             : redactUrl(exchange.request.url);
-          process.stderr.write(
-            `${exchange.id}  ${String(status).padEnd(4)} ${exchange.request.method.padEnd(6)} ${url}\n`,
+          const edited = exchange.tags.some((t) => t.startsWith('intercept:') && t.endsWith('edited'));
+          say(
+            `${exchange.id}  ${String(status).padEnd(4)} ${exchange.request.method.padEnd(6)} ${url}` +
+              (edited ? '  (edited at the intercept)' : ''),
           );
         }
       },
       onFrame: (frame) => project.appendFrame(frame),
       onTunnel: (host, reason) => {
         if (!bool(parsed, 'quiet')) {
-          process.stderr.write(`tunnelled without interception: ${host} (${reason})\n`);
+          say(`tunnelled without interception: ${host} (${reason})`);
         }
       },
     });
@@ -362,24 +400,73 @@ const proxyCommand: Command = {
     log(parsed, `CA ${ca.caCert} -- \`awb ca trust\` explains how to install it`);
     log(parsed, 'in scope:');
     for (const rule of scope.include) log(parsed, `  ${formatRule(rule)}`);
+    if (interceptor !== undefined) {
+      log(
+        parsed,
+        `intercepting requests${interceptor.interceptingResponses ? ' and responses' : ''}: ` +
+          'f forward, e edit, d drop, i on/off, r responses, ? keys',
+      );
+    }
     log(parsed, 'press ctrl-c to stop');
 
     await new Promise<void>((resolveWait) => {
+      let detach: (() => void) | undefined;
       const stop = (): void => {
+        detach?.();
         log(parsed, '');
         log(
           parsed,
           `recorded ${proxy.stats.recorded} exchanges, ${proxy.stats.frames} websocket messages, ` +
-            `tunnelled ${proxy.stats.tunnelled}, refused ${proxy.stats.blocked}, failed ${proxy.stats.failed}`,
+            `tunnelled ${proxy.stats.tunnelled}, refused ${proxy.stats.blocked}, failed ${proxy.stats.failed}` +
+            (interceptor === undefined ? '' : `, dropped ${proxy.stats.dropped}`),
         );
         void proxy.close().then(resolveWait);
       };
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
+      // In raw mode ctrl-c arrives as a keystroke rather than a signal.
+      if (console_ !== undefined) detach = attachToTerminal(console_, process.stdin, stop);
     });
     return EXIT_OK;
   },
 };
+
+/** The interceptor the proxy options ask for, or none. */
+function buildInterceptor(parsed: ReturnType<typeof parse>): Interceptor | undefined {
+  const responses = bool(parsed, 'intercept-responses');
+  if (!bool(parsed, 'intercept') && !responses) {
+    for (const name of ['intercept-url', 'intercept-method', 'intercept-timeout', 'intercept-on-timeout']) {
+      if (parsed.options[name] !== undefined) {
+        throw new UsageError(`--${name} only means something with --intercept`);
+      }
+    }
+    return undefined;
+  }
+  const regex = (name: string): RegExp | undefined => {
+    const raw = str(parsed, name);
+    if (raw === undefined) return undefined;
+    try {
+      return new RegExp(raw, name === 'intercept-method' ? 'i' : '');
+    } catch (err) {
+      throw new UsageError(`--${name} is not a regular expression: ${(err as Error).message}`);
+    }
+  };
+  const onTimeout = str(parsed, 'intercept-on-timeout') ?? 'forward';
+  if (onTimeout !== 'forward' && onTimeout !== 'drop') {
+    throw new UsageError(`--intercept-on-timeout is forward or drop, not ${JSON.stringify(onTimeout)}`);
+  }
+  const seconds = num(parsed, 'intercept-timeout', 120);
+  if (!(seconds > 0)) throw new UsageError('--intercept-timeout must be a positive number of seconds');
+  const url = regex('intercept-url');
+  const method = regex('intercept-method');
+  return new Interceptor({
+    requests: true,
+    responses,
+    timeoutMs: seconds * 1000,
+    onTimeout,
+    filter: { ...(url === undefined ? {} : { url }), ...(method === undefined ? {} : { method }) },
+  });
+}
 
 const lsCommand: Command = {
   name: 'ls',

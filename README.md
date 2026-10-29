@@ -209,6 +209,47 @@ session rule can do anything a replace rule can. Values may reference the
 environment — `{{env:BEARER}}` — so a rule file committed to a repository
 carries the shape of the session handling without the token.
 
+#### Interception
+
+`awb proxy --intercept` holds each in-scope request in the terminal until you
+decide what happens to it:
+
+```
+-- request #3 -- 1 held -------------------------------------------------
+POST /api/transfer HTTP/1.1
+Host: target.example
+Cookie: session=[redacted:32b:4c1e0a]
+Content-Type: application/json
+Content-Length: 27
+
+{"to":"acct-2","amount":10}
+[f]orward  [e]dit  [d]rop  [i]ntercept on/off  [r]esponses on/off  [?] keys
+```
+
+`e` opens the request in `$VISUAL` or `$EDITOR`, and the saved text is what is
+sent. Three things are different from what you may be used to:
+
+- **Out-of-scope traffic is never held**, because it is never decrypted. An
+  edited request is asked about again before it is sent, since an edit can
+  change the host, and an edit that leaves scope is refused.
+- **Nothing is recomputed silently.** If your edit leaves `Content-Length`
+  disagreeing with the body, you are asked whether to send it as edited or to
+  correct it — a wrong length is often the point, so it is your call, not the
+  tool's. The newline an editor adds at the end of a file is removed, because
+  in a request it is a byte of body.
+- **The record is the wire.** An edited request is recorded as sent, tagged
+  `intercept:edited`. An edited *response* changes only what the browser is
+  given; the project keeps what the target actually sent, tagged
+  `intercept:response-edited`.
+
+`--intercept-responses` holds responses too. `--intercept-url` and
+`--intercept-method` take regular expressions to hold only some traffic.
+A held message waits 120 seconds (`--intercept-timeout`) and is then forwarded,
+or dropped with `--intercept-on-timeout drop`, because a browser that has
+given up on a request should not leave it in front of you. A request whose
+client hangs up leaves the queue on its own. The screen redacts credentials
+the way the proxy log does; the editor is handed the real bytes.
+
 ### Replay
 
 Mutations are structural, not textual: `query:id=2` edits one parameter of a
@@ -457,10 +498,9 @@ it, because the capture has to stay intact for replay to work.
 Burp Suite Professional is a mature commercial product and there is no point
 pretending otherwise. Specifically:
 
-- **No GUI, and no interactive interception.** You cannot pause a request and
-  hand-edit it in a window. `awb replay --edit` prints the editable text form
-  and rules do the same job declaratively, but if a point-and-click workflow is
-  what you need, this is not it.
+- **No GUI.** Interception happens in the terminal, one keystroke per
+  decision, and editing happens in your own editor. If a point-and-click
+  workflow with a request tree beside it is what you need, this is not it.
 - **No HTTP/2 or HTTP/3.** The proxy negotiates `http/1.1` by ALPN. Most of
   what this tool exists to test is expressible over 1.1, and a deliberate
   byte-level HTTP/2 test needs a different kind of client. An application

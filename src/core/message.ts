@@ -172,6 +172,48 @@ export function parseRawRequest(
   return { method, url, httpVersion, headers, body, startedAt };
 }
 
+/**
+ * Parse a raw response, the inverse of `serialiseResponse`.
+ *
+ * Used when a response is edited at the intercept. Unlike the wire parser in
+ * `net/send` this does not interpret framing: the body is everything after
+ * the blank line, because what was written out was an already-decoded body
+ * and a Transfer-Encoding header left in the text must not make it be
+ * de-chunked a second time.
+ */
+export function parseRawResponse(raw: string, elapsedMs = 0): HttpResponse {
+  const crlf = raw.indexOf('\r\n\r\n');
+  const lf = raw.indexOf('\n\n');
+  let headEnd = raw.length;
+  let bodyStart = raw.length;
+  if (crlf >= 0 && (lf < 0 || crlf <= lf)) {
+    headEnd = crlf;
+    bodyStart = crlf + 4;
+  } else if (lf >= 0) {
+    headEnd = lf;
+    bodyStart = lf + 2;
+  }
+  const lines = raw.slice(0, headEnd).split(/\r?\n/);
+  const first = lines.shift() ?? '';
+  const m = /^HTTP\/(\S+)\s+(\d{3})(?:\s+(.*))?$/.exec(first);
+  if (!m) throw new Error(`not a status line: ${JSON.stringify(first)}`);
+  const headers: [string, string][] = [];
+  for (const line of lines) {
+    if (line.length === 0) continue;
+    const i = line.indexOf(':');
+    if (i < 0) throw new Error(`not a header line: ${JSON.stringify(line)}`);
+    headers.push([line.slice(0, i), line.slice(i + 1).replace(/^ /, '')]);
+  }
+  return {
+    status: Number(m[2]),
+    statusText: (m[3] ?? '').trimEnd(),
+    httpVersion: m[1] as string,
+    headers,
+    body: Buffer.from(raw.slice(bodyStart), 'utf8'),
+    elapsedMs,
+  };
+}
+
 function resolveTarget(
   target: string,
   headers: readonly (readonly [string, string])[],

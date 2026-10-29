@@ -21,6 +21,7 @@ export { Proxy, startProxy, type ProxyOptions, type ProxyStats } from './proxy/s
 export * from './proxy/ca.js';
 export * from './proxy/rules.js';
 export * from './proxy/websocket.js';
+export * from './proxy/intercept.js';
 
 export * from './replay/replay.js';
 export * from './replay/diff.js';

@@ -361,12 +361,25 @@ export function toEditable(request: HttpRequest): string {
 }
 
 export function fromEditable(text: string, origin: string): HttpRequest {
-  const lines = text.split(/\r?\n/);
-  let start = 0;
-  while (start < lines.length && (lines[start]?.startsWith('#') === true || lines[start] === '')) {
-    start += 1;
+  return parseRawRequest(stripLeadingComments(text), origin);
+}
+
+/**
+ * Remove the comment block in front of the request line, and nothing else.
+ *
+ * Everything after it is handed on byte for byte. Rejoining the lines with
+ * CRLF -- which is what this used to do -- also rewrote every newline in the
+ * body, so a JSON body edited in a Unix editor went out with CRLFs nobody
+ * typed and a Content-Length that no longer matched.
+ */
+export function stripLeadingComments(text: string): string {
+  let rest = text;
+  for (;;) {
+    if (!(rest.startsWith('#') || rest.startsWith('\n') || rest.startsWith('\r\n'))) return rest;
+    const nl = rest.indexOf('\n');
+    if (nl < 0) return '';
+    rest = rest.slice(nl + 1);
   }
-  return parseRawRequest(lines.slice(start).join('\r\n'), origin);
 }
 
 /** Does this request carry a body shape a `form:` or `json:` mutation fits? */
