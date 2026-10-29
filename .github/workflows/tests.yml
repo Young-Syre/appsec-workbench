@@ -33,13 +33,42 @@ jobs:
         run: npm ci
 
       # Playwright is an optional peer dependency and only `awb browse` needs
-      # it. Its browser is installed here so the real-browser integration test
-      # runs rather than skipping, which is the whole point of having it.
-      - name: Install Chromium for the browser tests
-        run: npx playwright install --with-deps chromium
+      # it. A browser has to be available or the real-browser test skips, which
+      # defeats the point of having it.
+      #
+      # --with-deps is deliberately not used: it refuses to run on a runner
+      # image newer than the Playwright release knows about, and the runner
+      # already has the shared libraries. If the download fails anyway the
+      # suite falls back to the Chrome on the image, which is a code path worth
+      # exercising here rather than only on a developer's machine.
+      - name: Install Chromium, or fall back to the runner's Chrome
+        run: npx playwright install chromium || echo "::notice::Playwright's own Chromium is unavailable; falling back to the installed Chrome"
 
       - name: Build
         run: npm run build
+
+      - name: A browser really is available, so the browser tests cannot silently skip
+        run: |
+          node --input-type=module -e "
+          import { loadPlaywright, findInstalledChrome } from './dist/src/browser/drive.js';
+          const playwright = await loadPlaywright();
+          const tryLaunch = async (executablePath) => {
+            try {
+              const browser = await playwright.chromium.launch(
+                executablePath === undefined ? { headless: true } : { headless: true, executablePath },
+              );
+              await browser.close();
+              return true;
+            } catch {
+              return false;
+            }
+          };
+          if (await tryLaunch(undefined)) { console.log(\"ok: Playwright's own Chromium\"); process.exit(0); }
+          const found = findInstalledChrome();
+          if (found !== undefined && (await tryLaunch(found))) { console.log('ok: fell back to ' + found); process.exit(0); }
+          console.error('no usable browser; the browser tests would skip and prove nothing');
+          process.exit(1);
+          "
 
       - name: Test
         run: npm test
